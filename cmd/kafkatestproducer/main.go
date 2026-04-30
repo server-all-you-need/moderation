@@ -92,7 +92,6 @@ func main() {
 			AuthorID:       fmt.Sprintf("author_%d", (i%5)+1),
 			AuthorAvatar:   fmt.Sprintf("http://example.com/avatar/author%d.png", (i%5)+1),
 			AuthorUsername: fmt.Sprintf("测试用户%d", (i%5)+1),
-			Tags:           []string{"测试", fmt.Sprintf("标签%d", i)},
 			Status:         0,
 			ViewCount:      int64(i * 10),
 			OfficialTag:    0,

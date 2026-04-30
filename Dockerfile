@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags="-w -s" -o /app/post_audit_ser
 # =================================================================
 # Stage 2: The Final Stage
 # =================================================================
-FROM alpine:latest
+FROM alpine:3.21
 
 # 安装 ca-certificates 对需要访问外部HTTPS服务的应用（如阿里云）至关重要
 RUN apk --no-cache add ca-certificates
