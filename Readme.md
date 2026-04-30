@@ -12,6 +12,12 @@
 
 其核心设计目标是：无论您初期选择哪家云服务商的审核API，或未来希望更换、组合使用多家服务商的能力，`PostAudit Pro` 都能以最小的改动成本平滑适应您的业务发展需求。
 
+## Platform Gateway 状态
+
+当前 `platform` 仓库还没有为 `post-audit-pro` 提供根级 Kubernetes manifest 和稳定 `Service`，因此它暂时还不能接入由平台统一管理的 Gateway。
+
+后续若要接入，请先在平台仓补齐 Deployment/Service，再按 [docs/platform-gateway.md](/Users/gaoddy/Projects/platform/docs/platform-gateway.md) 中的登记契约申请 hostname 和 route。
+
 ---
 
 ## 🏗️ 系统架构图
