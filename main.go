@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -26,13 +25,6 @@ func main() {
 	if err := core.LoadConfig(configFile, &cfg); err != nil {
 		log.Fatalf("致命错误: 加载配置文件 '%s' 失败: %v", configFile, err)
 	}
-
-	// 【调试日志】打印最终生效的配置，非常有助于验证 CI/CD
-	configBytes, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		log.Fatalf("无法序列化最终配置以进行打印: %v", err)
-	}
-	log.Printf("应用最终将使用以下配置:\n%s\n", string(configBytes))
 
 	logger, loggerErr := core.NewZapLogger(cfg.ZapConfig)
 	if loggerErr != nil {
