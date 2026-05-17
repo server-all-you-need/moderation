@@ -29,19 +29,30 @@ import (
 // AuditConsumerGroupHandler 实现了 sarama.ConsumerGroupHandler 接口，
 // 用于处理来自 Kafka 消费者组的消息。
 type AuditConsumerGroupHandler struct {
-	logger      *core.ZapLogger
-	ready       chan bool     // 用于通知消费者组已准备好开始消费
-	postAuditor PostAuditor   // 注入的业务逻辑处理器 (其 ProcessBatch 方法已更新)
-	producer    EventProducer // 注入的 Kafka 生产者 (其接口签名已更新)
+	logger             *core.ZapLogger
+	ready              chan bool     // 用于通知消费者组已准备好开始消费
+	postAuditor        PostAuditor   // 注入的业务逻辑处理器 (其 ProcessBatch 方法已更新)
+	producer           EventProducer // 注入的 Kafka 生产者 (其接口签名已更新)
+	batchConfig        config.BatchConfig
+	flushCheckInterval time.Duration
 }
 
 // NewAuditConsumerGroupHandler 创建一个新的 AuditConsumerGroupHandler 实例。
-func NewAuditConsumerGroupHandler(logger *core.ZapLogger, auditor PostAuditor, producer EventProducer) *AuditConsumerGroupHandler {
+func NewAuditConsumerGroupHandler(
+	logger *core.ZapLogger,
+	auditor PostAuditor,
+	producer EventProducer,
+	batchConfig config.BatchConfig,
+) *AuditConsumerGroupHandler {
+	effectiveBatchConfig := batchConfig.WithDefaults()
+
 	return &AuditConsumerGroupHandler{
-		logger:      logger,
-		ready:       make(chan bool),
-		postAuditor: auditor,
-		producer:    producer,
+		logger:             logger,
+		ready:              make(chan bool),
+		postAuditor:        auditor,
+		producer:           producer,
+		batchConfig:        effectiveBatchConfig,
+		flushCheckInterval: computeFlushCheckInterval(effectiveBatchConfig),
 	}
 }
 
@@ -71,13 +82,8 @@ func (handler *AuditConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGr
 		zap.Int64("初始偏移量(initial_offset)", claim.InitialOffset()),
 	)
 
-	// 初始化批次缓冲区
-	messageBuffer := make([]*sarama.ConsumerMessage, 0, constants.KafkaConsumerBatchSize)
-	// 3. postDataBuffer 现在存储 kafkaevents.PostData
-	postDataBuffer := make([]kafkaevents.PostData, 0, constants.KafkaConsumerBatchSize)
-
-	// 批次处理的定时器
-	ticker := time.NewTicker(constants.KafkaConsumerBatchTimeout)
+	batch := newMicroBatch(handler.batchConfig)
+	ticker := time.NewTicker(handler.flushCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -87,12 +93,9 @@ func (handler *AuditConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGr
 				handler.logger.Info("Kafka 消费者组: 消息通道已关闭，处理缓冲区中剩余消息并退出 ConsumeClaim。",
 					zap.String("主题(topic)", claim.Topic()),
 					zap.Int32("分区(partition)", claim.Partition()),
-					zap.Int("剩余消息数", len(messageBuffer)),
+					zap.Int("剩余消息数", len(batch.messages)),
 				)
-				// 处理缓冲区中剩余的消息
-				if len(messageBuffer) > 0 {
-					handler.processMessageBatch(session.Context(), session, messageBuffer, postDataBuffer)
-				}
+				handler.flushBufferedBatch(session.Context(), session, batch, "claim_closed")
 				return nil // channel 关闭
 			}
 
@@ -125,39 +128,68 @@ func (handler *AuditConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGr
 				continue                         // 继续处理下一条消息
 			}
 
-			// 5. 将提取的 PostData 添加到缓冲区
-			messageBuffer = append(messageBuffer, message)
-			postDataBuffer = append(postDataBuffer, pendingAuditEvent.Post) // <-- 从事件中提取 PostData
+			bufferedAt := time.Now()
+			batch.add(message, pendingAuditEvent.Post, bufferedAt)
 
-			if len(messageBuffer) >= constants.KafkaConsumerBatchSize {
-				handler.logger.Info("Kafka 消费者组: 达到批次大小，准备处理消息批次", zap.Int("当前批次大小", len(messageBuffer)))
-				handler.processMessageBatch(session.Context(), session, messageBuffer, postDataBuffer)
-				// 重置缓冲区
-				messageBuffer = make([]*sarama.ConsumerMessage, 0, constants.KafkaConsumerBatchSize)
-				postDataBuffer = make([]kafkaevents.PostData, 0, constants.KafkaConsumerBatchSize)
-				ticker.Reset(constants.KafkaConsumerBatchTimeout)
+			if reason := batch.flushReason(bufferedAt); reason != flushReasonNone {
+				handler.flushBufferedBatch(session.Context(), session, batch, string(reason))
 			}
 
 		case <-ticker.C:
-			if len(messageBuffer) > 0 {
-				handler.logger.Info("Kafka 消费者组: 批次处理超时，准备处理当前缓冲的消息", zap.Int("当前批次大小", len(messageBuffer)))
-				handler.processMessageBatch(session.Context(), session, messageBuffer, postDataBuffer)
-				// 重置缓冲区
-				messageBuffer = make([]*sarama.ConsumerMessage, 0, constants.KafkaConsumerBatchSize)
-				postDataBuffer = make([]kafkaevents.PostData, 0, constants.KafkaConsumerBatchSize)
+			if reason := batch.flushReason(time.Now()); reason != flushReasonNone {
+				handler.flushBufferedBatch(session.Context(), session, batch, string(reason))
 			}
 		case <-session.Context().Done():
 			handler.logger.Info("Kafka 消费者组: 会话上下文已完成，处理缓冲区中剩余消息并退出 ConsumeClaim。",
 				zap.String("主题(topic)", claim.Topic()),
 				zap.Int32("分区(partition)", claim.Partition()),
-				zap.Int("剩余消息数", len(messageBuffer)),
+				zap.Int("剩余消息数", len(batch.messages)),
 			)
-			if len(messageBuffer) > 0 {
-				handler.processMessageBatch(session.Context(), session, messageBuffer, postDataBuffer)
-			}
+			handler.flushBufferedBatch(session.Context(), session, batch, "session_done")
 			return nil
 		}
 	}
+}
+
+func (handler *AuditConsumerGroupHandler) flushBufferedBatch(
+	ctx context.Context,
+	session sarama.ConsumerGroupSession,
+	batch *microBatch,
+	reason string,
+) {
+	if len(batch.messages) == 0 {
+		return
+	}
+
+	messageBatch, postBatch := batch.drain()
+	handler.logger.Info("Kafka 消费者组: 准备处理当前缓冲的消息",
+		zap.Int("当前批次大小", len(messageBatch)),
+		zap.String("flush_reason", reason),
+	)
+	handler.processMessageBatch(ctx, session, messageBatch, postBatch)
+}
+
+func computeFlushCheckInterval(batchConfig config.BatchConfig) time.Duration {
+	candidates := []time.Duration{
+		batchConfig.IdleFlushDuration() / 5,
+		batchConfig.MaxWaitDuration() / 5,
+	}
+
+	interval := 100 * time.Millisecond
+	for _, candidate := range candidates {
+		if candidate <= 0 {
+			continue
+		}
+		if candidate < interval {
+			interval = candidate
+		}
+	}
+
+	if interval < 10*time.Millisecond {
+		return 10 * time.Millisecond
+	}
+
+	return interval
 }
 
 // processMessageBatch 的 postDataBatch 参数类型更新
@@ -262,7 +294,7 @@ func StartConsumerGroup(
 		return errors.New(msg)
 	}
 
-	handler := NewAuditConsumerGroupHandler(zapLogger, auditor, producer)
+	handler := NewAuditConsumerGroupHandler(zapLogger, auditor, producer, kafkaCfg.Consumer.EffectiveBatch())
 
 	consumerGroup, err := sarama.NewConsumerGroup(kafkaCfg.Brokers, kafkaCfg.ConsumerGroupID, saramaConfig)
 	if err != nil {

@@ -34,6 +34,10 @@ kafka: # Kafka configuration
     # auto_offset_reset: "earliest" # Sarama uses Offsets.Initial. For post-audit, it's forced to "earliest"
     session_timeout_ms: 30000 # Consumer session timeout in milliseconds
     heartbeat_interval_ms: 10000 # Consumer heartbeat interval in milliseconds
+    batch:
+      max_batch_size: 10
+      idle_flush_ms: 1000
+      max_wait_ms: 3000
     offsets: #
       auto_commit_enable: false # Recommended false for manual commit
       auto_commit_interval_ms: 5000 # Interval if auto-commit is enabled

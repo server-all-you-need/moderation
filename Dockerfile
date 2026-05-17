@@ -1,4 +1,4 @@
-# post_audit/Dockerfile (最终修正版)
+# syntax=docker/dockerfile:1.7
 
 # =================================================================
 # Stage 1: The Builder Stage
@@ -9,10 +9,12 @@ WORKDIR /app
 RUN apk add --no-cache git
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags="-w -s" -o /app/post_audit_service ./main.go
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/post_audit_service ./main.go
 
 
 # =================================================================

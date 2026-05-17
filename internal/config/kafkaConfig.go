@@ -2,6 +2,12 @@ package config
 
 import "time"
 
+const (
+	DefaultKafkaConsumerBatchMaxSize                   = 10
+	DefaultKafkaConsumerBatchIdleFlushMs time.Duration = 1000
+	DefaultKafkaConsumerBatchMaxWaitMs   time.Duration = 3000
+)
+
 // KafkaConfig 包含了 Kafka 相关的配置
 type KafkaConfig struct {
 	Brokers               []string       `mapstructure:"brokers"`                  // Kafka Broker 地址列表
@@ -41,12 +47,47 @@ type ProducerConfig struct {
 
 // ConsumerConfig 包含消费者的特定配置
 type ConsumerConfig struct {
-	AutoOffsetReset     string        `mapstructure:"auto_offset_reset"`      // "earliest", "latest" (注意：Sarama 中此行为主要通过 Offsets.Initial 控制)
-	SessionTimeoutMs    time.Duration `mapstructure:"session_timeout_ms"`     // 消费者会话超时 (毫秒)
-	HeartbeatIntervalMs time.Duration `mapstructure:"heartbeat_interval_ms"`  // 消费者心跳间隔 (毫秒) <--- 添加此字段
+	AutoOffsetReset     string        `mapstructure:"auto_offset_reset"`     // "earliest", "latest" (注意：Sarama 中此行为主要通过 Offsets.Initial 控制)
+	SessionTimeoutMs    time.Duration `mapstructure:"session_timeout_ms"`    // 消费者会话超时 (毫秒)
+	HeartbeatIntervalMs time.Duration `mapstructure:"heartbeat_interval_ms"` // 消费者心跳间隔 (毫秒) <--- 添加此字段
+	Batch               BatchConfig   `mapstructure:"batch"`
 	Offsets             OffsetsConfig `mapstructure:"offsets"`
 	// RebalanceStrategy string        `mapstructure:"rebalance_strategy"` // 可选: "range", "roundrobin", "sticky"
 	// 可以添加更多 Sarama 消费者配置项，例如 FetchMin, FetchDefault, MaxWaitTime 等
+}
+
+type BatchConfig struct {
+	MaxBatchSize int           `mapstructure:"max_batch_size"`
+	IdleFlushMs  time.Duration `mapstructure:"idle_flush_ms"`
+	MaxWaitMs    time.Duration `mapstructure:"max_wait_ms"`
+}
+
+func (cfg ConsumerConfig) EffectiveBatch() BatchConfig {
+	return cfg.Batch.WithDefaults()
+}
+
+func (cfg BatchConfig) WithDefaults() BatchConfig {
+	batch := cfg
+
+	if batch.MaxBatchSize <= 0 {
+		batch.MaxBatchSize = DefaultKafkaConsumerBatchMaxSize
+	}
+	if batch.IdleFlushMs <= 0 {
+		batch.IdleFlushMs = DefaultKafkaConsumerBatchIdleFlushMs
+	}
+	if batch.MaxWaitMs <= 0 {
+		batch.MaxWaitMs = DefaultKafkaConsumerBatchMaxWaitMs
+	}
+
+	return batch
+}
+
+func (cfg BatchConfig) IdleFlushDuration() time.Duration {
+	return cfg.IdleFlushMs * time.Millisecond
+}
+
+func (cfg BatchConfig) MaxWaitDuration() time.Duration {
+	return cfg.MaxWaitMs * time.Millisecond
 }
 
 // OffsetsConfig 包含消费者偏移量相关的配置
