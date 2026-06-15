@@ -33,6 +33,8 @@ type AuditConsumerGroupHandler struct {
 	ready              chan bool     // 用于通知消费者组已准备好开始消费
 	postAuditor        PostAuditor   // 注入的业务逻辑处理器 (其 ProcessBatch 方法已更新)
 	producer           EventProducer // 注入的 Kafka 生产者 (其接口签名已更新)
+	auditRecorder      AuditRecorder
+	auditEnvironment   string
 	batchConfig        config.BatchConfig
 	flushCheckInterval time.Duration
 }
@@ -44,13 +46,27 @@ func NewAuditConsumerGroupHandler(
 	producer EventProducer,
 	batchConfig config.BatchConfig,
 ) *AuditConsumerGroupHandler {
+	return NewAuditConsumerGroupHandlerWithRecorder(logger, auditor, producer, batchConfig, NopAuditRecorder{})
+}
+
+func NewAuditConsumerGroupHandlerWithRecorder(
+	logger *core.ZapLogger,
+	auditor PostAuditor,
+	producer EventProducer,
+	batchConfig config.BatchConfig,
+	recorder AuditRecorder,
+) *AuditConsumerGroupHandler {
 	effectiveBatchConfig := batchConfig.WithDefaults()
+	if recorder == nil {
+		recorder = NopAuditRecorder{}
+	}
 
 	return &AuditConsumerGroupHandler{
 		logger:             logger,
 		ready:              make(chan bool),
 		postAuditor:        auditor,
 		producer:           producer,
+		auditRecorder:      recorder,
 		batchConfig:        effectiveBatchConfig,
 		flushCheckInterval: computeFlushCheckInterval(effectiveBatchConfig),
 	}
@@ -116,7 +132,8 @@ func (handler *AuditConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGr
 					zap.ByteString("原始消息体(raw_value)", message.Value),
 				)
 				// 发送到DLQ
-				dlqErr := handler.producer.SendToDLQ(session.Context(), message, "反序列化 PostPendingAuditEvent 失败: "+err.Error())
+				reason := "反序列化 PostPendingAuditEvent 失败: " + err.Error()
+				dlqErr := handler.producer.SendToDLQ(session.Context(), message, reason)
 				if dlqErr != nil {
 					handler.logger.Error("Kafka 消费者组: 发送消息到DLQ失败 (因反序列化错误)",
 						zap.String("主题(topic)", message.Topic),
@@ -124,11 +141,13 @@ func (handler *AuditConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGr
 						zap.Error(dlqErr),
 					)
 				}
+				recordAuditFailure(handler.logger, "record_dlq", handler.auditRecorder.RecordDLQ(session.Context(), dlqRecord(handler.auditEnvironment, message, reason)))
 				session.MarkMessage(message, "") // 标记这条坏消息已处理
 				continue                         // 继续处理下一条消息
 			}
 
 			bufferedAt := time.Now()
+			recordAuditFailure(handler.logger, "record_pending", handler.auditRecorder.RecordPending(session.Context(), pendingRecord(handler.auditEnvironment, message, pendingAuditEvent.Post)))
 			batch.add(message, pendingAuditEvent.Post, bufferedAt)
 
 			if reason := batch.flushReason(bufferedAt); reason != flushReasonNone {
@@ -248,9 +267,11 @@ func (handler *AuditConsumerGroupHandler) processMessageBatch(
 				)
 				// 即使发送到DLQ失败，也应该尝试标记原始消息，避免无限重试
 			}
+			recordAuditFailure(handler.logger, "record_result", handler.auditRecorder.RecordResult(ctx, resultRecord(handler.auditEnvironment, originalMessage, result)))
 			session.MarkMessage(originalMessage, "") // 标记已处理（尝试过DLQ）
 		} else {
 			// 成功处理（无论是 approved 还是 rejected 事件已发送）
+			recordAuditFailure(handler.logger, "record_result", handler.auditRecorder.RecordResult(ctx, resultRecord(handler.auditEnvironment, originalMessage, result)))
 			session.MarkMessage(originalMessage, "")
 			handler.logger.Info("Kafka 消费者组: 单个帖子成功处理，标记偏移量",
 				zap.String("原始DataID/帖子ID", result.OriginalDataID),
@@ -277,6 +298,16 @@ func StartConsumerGroup(
 	auditor PostAuditor, // PostAuditor 接口已更新
 	producer EventProducer, // EventProducer 接口已更新
 ) error {
+	return StartConsumerGroupWithRecorder(appCfg, zapLogger, auditor, producer, NopAuditRecorder{})
+}
+
+func StartConsumerGroupWithRecorder(
+	appCfg *config.AppConfig,
+	zapLogger *core.ZapLogger,
+	auditor PostAuditor,
+	producer EventProducer,
+	recorder AuditRecorder,
+) error {
 	kafkaCfg := appCfg.Kafka
 
 	saramaConfig, err := GetSaramaConfig(kafkaCfg, constants.ServiceName, zapLogger)
@@ -294,7 +325,8 @@ func StartConsumerGroup(
 		return errors.New(msg)
 	}
 
-	handler := NewAuditConsumerGroupHandler(zapLogger, auditor, producer, kafkaCfg.Consumer.EffectiveBatch())
+	handler := NewAuditConsumerGroupHandlerWithRecorder(zapLogger, auditor, producer, kafkaCfg.Consumer.EffectiveBatch(), recorder)
+	handler.auditEnvironment = appCfg.AdminAudit.PlatformEnvironmentKey
 
 	consumerGroup, err := sarama.NewConsumerGroup(kafkaCfg.Brokers, kafkaCfg.ConsumerGroupID, saramaConfig)
 	if err != nil {

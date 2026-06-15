@@ -10,6 +10,7 @@ require (
 	github.com/alibabacloud-go/tea v1.3.9
 	github.com/alibabacloud-go/tea-utils/v2 v2.0.7
 	github.com/google/uuid v1.6.0
+	github.com/lib/pq v1.10.9
 	go.uber.org/zap v1.27.0
 )
 

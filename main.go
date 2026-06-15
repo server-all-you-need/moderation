@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"flag"
 	"log"
 	"os"
@@ -13,6 +15,7 @@ import (
 	"github.com/Xushengqwer/post_audit/internal/config"
 	"github.com/Xushengqwer/post_audit/internal/constants"
 	"github.com/Xushengqwer/post_audit/internal/kafka"
+	_ "github.com/lib/pq"
 	"go.uber.org/zap"
 )
 
@@ -79,12 +82,32 @@ func main() {
 	auditService := kafka.NewAuditProcessorService(logger, moderator, kafkaProd)
 	logger.Info("业务逻辑处理器 (AuditProcessorService) 初始化成功。")
 
+	auditRecorder := kafka.AuditRecorder(kafka.NopAuditRecorder{})
+	var auditDB *sql.DB
+	if cfg.AdminAudit.DatabaseURL != "" {
+		var dbErr error
+		auditDB, dbErr = sql.Open("postgres", cfg.AdminAudit.DatabaseURL)
+		if dbErr != nil {
+			logger.Fatal("初始化 admin 审计数据库失败", zap.Error(dbErr))
+		}
+		if dbErr = auditDB.PingContext(context.Background()); dbErr != nil {
+			logger.Fatal("连接 admin 审计数据库失败", zap.Error(dbErr))
+		}
+		defer func() {
+			if err := auditDB.Close(); err != nil {
+				logger.Error("关闭 admin 审计数据库失败", zap.Error(err))
+			}
+		}()
+		auditRecorder = kafka.NewPostgresAuditRecorder(auditDB, cfg.AdminAudit.PlatformEnvironmentKey, logger)
+		logger.Info("admin 审计记录器已启用", zap.String("platform_environment_key", cfg.AdminAudit.PlatformEnvironmentKey))
+	}
+
 	logger.Info("准备启动 Kafka 消费者组...")
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := kafka.StartConsumerGroup(&cfg, logger, auditService, kafkaProd); err != nil {
+		if err := kafka.StartConsumerGroupWithRecorder(&cfg, logger, auditService, kafkaProd, auditRecorder); err != nil {
 			logger.Error("Kafka 消费者组运行出错或已停止", zap.Error(err))
 		}
 	}()

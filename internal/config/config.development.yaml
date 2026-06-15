@@ -1,6 +1,10 @@
 # 或其他您希望默认使用的已实现审核云平台
 audit_platform: "aliyun"
 
+admin_audit:
+  database_url: ""
+  platform_environment_key: "dev"
+
 # Zap 日志配置 (根据共享模块更新)
 zapConfig:
   level: "debug"    # 日志级别 (例如: "debug", "info", "warn", "error")
