@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/IBM/sarama"
 	"github.com/Xushengqwer/go-common/core"
@@ -166,7 +167,10 @@ func auditTaskID(environmentKey string, originalID string) string {
 func contentSummary(post kafkaevents.PostData) string {
 	value := strings.TrimSpace(post.Title + "\n" + post.Content)
 	if len(value) > 240 {
-		return value[:240]
+		value = value[:240]
+		for !utf8.ValidString(value) {
+			value = value[:len(value)-1]
+		}
 	}
 	return value
 }

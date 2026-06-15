@@ -117,9 +117,7 @@ func (s *auditProcessorService) ProcessBatch(ctx context.Context, posts []kafkae
 		}
 
 		var sdkErr *tea.SDKError
-		if (errors.As(errCallModerator, &sdkErr) && strings.Contains(strings.ToLower(tea.StringValue(sdkErr.Code)), "throttling")) ||
-			(strings.Contains(strings.ToLower(errCallModerator.Error()), "throttling")) ||
-			(strings.Contains(strings.ToLower(errCallModerator.Error()), "限流")) {
+		if isReviewThrottlingError(errCallModerator, sdkErr) {
 			s.logger.Warn("ProcessBatch: 遭遇审核平台限流",
 				zap.String("审核平台", s.moderator.GetPlatformName()),
 				zap.Int("API调用尝试次数", attemptCount),
@@ -154,6 +152,9 @@ func (s *auditProcessorService) ProcessBatch(ctx context.Context, posts []kafkae
 				OriginalDataID: fmt.Sprintf("%d", post_item.ID),
 				Error:          fmt.Errorf("审核平台API最终失败: %w", errCallModerator),
 			}
+		}
+		if !isReviewThrottlingError(errCallModerator, nil) {
+			return processedResults, nil
 		}
 		return processedResults, fmt.Errorf("审核平台API最终失败: %w", errCallModerator)
 	}
@@ -300,4 +301,16 @@ func (s *auditProcessorService) ProcessBatch(ctx context.Context, posts []kafkae
 		finalProcessedResults[i] = currentProcessedResult
 	}
 	return finalProcessedResults, nil
+}
+
+func isReviewThrottlingError(err error, sdkErr *tea.SDKError) bool {
+	if err == nil {
+		return false
+	}
+	if sdkErr == nil {
+		errors.As(err, &sdkErr)
+	}
+	return (sdkErr != nil && strings.Contains(strings.ToLower(tea.StringValue(sdkErr.Code)), "throttling")) ||
+		strings.Contains(strings.ToLower(err.Error()), "throttling") ||
+		strings.Contains(strings.ToLower(err.Error()), "限流")
 }

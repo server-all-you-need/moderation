@@ -3,7 +3,9 @@ package kafka
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/IBM/sarama"
 	"github.com/Xushengqwer/go-common/models/kafkaevents"
@@ -27,6 +29,17 @@ func TestAuditRecorderFailureDoesNotBlockBatchProcessing(t *testing.T) {
 
 	if session.markedCount() != 1 {
 		t.Fatalf("marked messages = %d, want 1", session.markedCount())
+	}
+}
+
+func TestContentSummaryTruncatesWithoutBreakingUTF8(t *testing.T) {
+	summary := contentSummary(kafkaevents.PostData{
+		Title:   "a",
+		Content: strings.Repeat("你", 100),
+	})
+
+	if !utf8.ValidString(summary) {
+		t.Fatalf("contentSummary() returned invalid UTF-8: %q", summary)
 	}
 }
 
