@@ -183,6 +183,26 @@ func TestConsumeClaimSendsBadPayloadToDLQAndMarksMessage(t *testing.T) {
 	}
 }
 
+func TestSetupCanRunAcrossMultipleConsumerGroupSessions(t *testing.T) {
+	auditor := &stubPostAuditor{}
+	producer := &stubEventProducer{}
+	handler := NewAuditConsumerGroupHandler(testLogger(t), auditor, producer, config.BatchConfig{})
+
+	if err := handler.Setup(newStubSession()); err != nil {
+		t.Fatalf("first Setup() error = %v", err)
+	}
+
+	select {
+	case <-handler.ready:
+	default:
+		t.Fatal("ready channel is not closed after first Setup()")
+	}
+
+	if err := handler.Setup(newStubSession()); err != nil {
+		t.Fatalf("second Setup() error = %v", err)
+	}
+}
+
 type stubPostAuditor struct {
 	mu               sync.Mutex
 	processBatchFunc func(context.Context, []kafkaevents.PostData) ([]ProcessedAuditResult, error)

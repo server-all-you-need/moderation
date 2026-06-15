@@ -31,6 +31,7 @@ import (
 type AuditConsumerGroupHandler struct {
 	logger             *core.ZapLogger
 	ready              chan bool     // 用于通知消费者组已准备好开始消费
+	readyOnce          sync.Once     // Sarama may call Setup again after a rebalance.
 	postAuditor        PostAuditor   // 注入的业务逻辑处理器 (其 ProcessBatch 方法已更新)
 	producer           EventProducer // 注入的 Kafka 生产者 (其接口签名已更新)
 	auditRecorder      AuditRecorder
@@ -78,7 +79,9 @@ func (handler *AuditConsumerGroupHandler) Setup(session sarama.ConsumerGroupSess
 		zap.Any("声明的分区(claims)", session.Claims()),
 		zap.String("成员ID(member_id)", session.MemberID()),
 	)
-	close(handler.ready) // 通知消费者已准备好
+	handler.readyOnce.Do(func() {
+		close(handler.ready) // 通知消费者已准备好
+	})
 	return nil
 }
 
