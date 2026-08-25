@@ -31,6 +31,9 @@ var (
 	ErrNotFound            = errors.New("moderation resource not found")
 	ErrConflict            = errors.New("moderation resource conflict")
 	ErrWebhookNotAllowed   = errors.New("webhook destination is not allowlisted")
+	ErrInvalidCursor       = errors.New("invalid cursor")
+	ErrInvalidLimit        = errors.New("invalid limit")
+	ErrInvalidTaskEvent    = errors.New("invalid moderation task event")
 )
 
 type TaskError struct {

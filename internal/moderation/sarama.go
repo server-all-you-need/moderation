@@ -1,9 +1,12 @@
 package moderation
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/IBM/sarama"
 )
@@ -50,21 +53,33 @@ func NewTaskConsumer(worker *Worker) *TaskConsumer {
 
 func (c *TaskConsumer) ProcessMessage(ctx context.Context, value []byte) error {
 	var event TaskEvent
-	if err := json.Unmarshal(value, &event); err != nil {
-		return err
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&event); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTaskEvent, err)
 	}
-	if event.TaskID == "" {
-		return fmt.Errorf("task_id is required")
+	if err := decoder.Decode(&struct{}{}); err == nil {
+		return fmt.Errorf("%w: multiple JSON values", ErrInvalidTaskEvent)
+	} else if !errors.Is(err, io.EOF) {
+		return fmt.Errorf("%w: %v", ErrInvalidTaskEvent, err)
+	}
+	if event.Version != 1 || event.TaskID == "" {
+		return fmt.Errorf("%w: version and task_id are required", ErrInvalidTaskEvent)
 	}
 	return c.worker.ProcessTaskEvent(ctx, event)
 }
 
 type TaskConsumerGroupHandler struct {
-	consumer *TaskConsumer
+	consumer        *TaskConsumer
+	poisonPublisher Publisher
 }
 
 func NewTaskConsumerGroupHandler(consumer *TaskConsumer) *TaskConsumerGroupHandler {
 	return &TaskConsumerGroupHandler{consumer: consumer}
+}
+
+func NewTaskConsumerGroupHandlerWithPoisonPublisher(consumer *TaskConsumer, poisonPublisher Publisher) *TaskConsumerGroupHandler {
+	return &TaskConsumerGroupHandler{consumer: consumer, poisonPublisher: poisonPublisher}
 }
 
 func (h *TaskConsumerGroupHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
@@ -80,6 +95,19 @@ func (h *TaskConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSess
 				return nil
 			}
 			if err := h.consumer.ProcessMessage(session.Context(), message.Value); err != nil {
+				if errors.Is(err, ErrInvalidTaskEvent) {
+					if h.poisonPublisher != nil {
+						value, marshalErr := json.Marshal(map[string]interface{}{"version": 1, "reason": "invalid_task_event"})
+						if marshalErr != nil {
+							return marshalErr
+						}
+						if publishErr := h.poisonPublisher.Publish(session.Context(), TopicModerationTaskDLQ, string(message.Key), value); publishErr != nil {
+							return publishErr
+						}
+					}
+					session.MarkMessage(message, "invalid_task_event")
+					continue
+				}
 				return err
 			}
 			session.MarkMessage(message, "")
@@ -92,8 +120,13 @@ type ConsumerGroup interface {
 	Close() error
 }
 
-func RunTaskConsumerGroup(ctx context.Context, group ConsumerGroup, worker *Worker) error {
-	handler := NewTaskConsumerGroupHandler(NewTaskConsumer(worker))
+func RunTaskConsumerGroup(ctx context.Context, group ConsumerGroup, worker *Worker, poisonPublisher ...Publisher) error {
+	defer group.Close()
+	var poison Publisher
+	if len(poisonPublisher) > 0 {
+		poison = poisonPublisher[0]
+	}
+	handler := NewTaskConsumerGroupHandlerWithPoisonPublisher(NewTaskConsumer(worker), poison)
 	for ctx.Err() == nil {
 		if err := group.Consume(ctx, []string{TopicModerationTasksV1}, handler); err != nil {
 			if ctx.Err() != nil {
@@ -102,7 +135,7 @@ func RunTaskConsumerGroup(ctx context.Context, group ConsumerGroup, worker *Work
 			return err
 		}
 	}
-	return group.Close()
+	return nil
 }
 
 type SaramaTopicAdmin struct {

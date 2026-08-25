@@ -12,7 +12,6 @@ const (
 type KafkaConfig struct {
 	Brokers               []string       `mapstructure:"brokers"`                  // Kafka Broker 地址列表
 	Version               string         `mapstructure:"version"`                  // Kafka 版本，例如 "2.8.1" (Sarama 需要)
-	Topics                KafkaTopics    `mapstructure:"topics"`                   // 主题配置
 	ConsumerGroupID       string         `mapstructure:"consumer_group_id"`        // 消费者组 ID
 	Producer              ProducerConfig `mapstructure:"producer"`                 // 生产者特定配置
 	Consumer              ConsumerConfig `mapstructure:"consumer"`                 // 消费者特定配置
@@ -25,12 +24,6 @@ type KafkaConfig struct {
 	TLSCertFile           string         `mapstructure:"tls_cert_file"`            // 客户端证书文件路径 (可选, 用于双向TLS)
 	TLSKeyFile            string         `mapstructure:"tls_key_file"`             // 客户端私钥文件路径 (可选, 用于双向TLS)
 	TLSInsecureSkipVerify bool           `mapstructure:"tls_insecure_skip_verify"` // 是否跳过服务器证书链和主机名验证 (不推荐用于生产)
-}
-
-// KafkaTopics 定义了服务需要用到的 Kafka 主题名称
-type KafkaTopics struct {
-	ModerationTasks string `mapstructure:"moderation_tasks"` // V2 task-ID-only topic
-	ModerationDLQ   string `mapstructure:"moderation_dlq"`   // V2 content-free DLQ topic
 }
 
 // ProducerConfig 包含生产者的特定配置

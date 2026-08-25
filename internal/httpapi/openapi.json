@@ -15,6 +15,7 @@
           "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
+          "502": { "$ref": "#/components/responses/Error" },
           "429": { "$ref": "#/components/responses/Error" },
           "503": { "$ref": "#/components/responses/Error" }
         }
@@ -25,7 +26,7 @@
         "operationId": "createModerationTask",
         "security": [{ "bearerAuth": [] }],
         "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
-        "requestBody": { "$ref": "#/components/requestBodies/ModerationRequest" },
+        "requestBody": { "$ref": "#/components/requestBodies/AsyncModerationRequest" },
         "responses": {
           "202": { "$ref": "#/components/responses/TaskAccepted" },
           "400": { "$ref": "#/components/responses/Error" },
@@ -44,6 +45,7 @@
         "parameters": [{ "$ref": "#/components/parameters/ResourceID" }],
         "responses": {
           "200": { "$ref": "#/components/responses/Task" },
+          "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
@@ -76,6 +78,7 @@
         "parameters": [{ "$ref": "#/components/parameters/ResourceID" }],
         "responses": {
           "200": { "$ref": "#/components/responses/Batch" },
+          "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
@@ -95,6 +98,7 @@
         ],
         "responses": {
           "200": { "$ref": "#/components/responses/TaskPage" },
+          "400": { "$ref": "#/components/responses/Error" },
           "401": { "$ref": "#/components/responses/Error" },
           "403": { "$ref": "#/components/responses/Error" },
           "404": { "$ref": "#/components/responses/Error" },
@@ -115,10 +119,17 @@
     },
     "requestBodies": {
       "ModerationRequest": {
+        "description": "Maximum request body is 1048576 bytes.",
         "required": true,
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModerationRequest" } } }
       },
+      "AsyncModerationRequest": {
+        "description": "Maximum request body is 1048576 bytes.",
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AsyncModerationRequest" } } }
+      },
       "BatchRequest": {
+        "description": "Maximum request body is 1048576 bytes.",
         "required": true,
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchRequest" } } }
       }
@@ -140,7 +151,19 @@
           "client_item_id": { "type": "string", "maxLength": 64 },
           "content_type": { "type": "string", "enum": ["text", "image"] },
           "policy": { "type": "string", "enum": ["text.comment", "text.nickname", "text.general", "image.comment", "image.avatar", "image.general"] },
-          "text": { "type": "string" },
+          "text": { "type": "string", "maxLength": 2000 },
+          "image_url": { "type": "string", "format": "uri" }
+        }
+      },
+      "AsyncModerationRequest": {
+        "type": "object",
+        "required": ["client_item_id", "content_type", "policy"],
+        "additionalProperties": false,
+        "properties": {
+          "client_item_id": { "type": "string", "maxLength": 64 },
+          "content_type": { "type": "string", "enum": ["text", "image"] },
+          "policy": { "type": "string", "enum": ["text.comment", "text.nickname", "text.general", "image.comment", "image.avatar", "image.general"] },
+          "text": { "type": "string", "maxLength": 2000 },
           "image_url": { "type": "string", "format": "uri" },
           "webhook_url": { "type": "string", "format": "uri" }
         }

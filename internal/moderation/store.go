@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -533,14 +532,7 @@ func (s *MemoryStore) ScheduleTaskRetry(_ context.Context, taskID string, delay 
 	task.Status = TaskStatusQueued
 	task.NextAttemptAt = &nextAttemptAt
 	task.ClaimedUntil = nil
-	code := auditplatform.ErrorCodeProviderTemporary
-	if strings.HasPrefix(message, "rate_limiter_unavailable:") {
-		code = "rate_limiter_unavailable"
-	}
-	if strings.HasPrefix(message, "rate_limited:") {
-		code = "rate_limited"
-	}
-	task.Error = &TaskError{Code: code, Message: message}
+	task.Error = retryTaskError(message)
 	task.UpdatedAt = s.now
 	s.tasks[taskID] = task
 	s.deriveBatchLocked(task.BatchID)

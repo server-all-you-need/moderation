@@ -2,11 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -18,6 +25,7 @@ import (
 	"github.com/Xushengqwer/post_audit/internal/moderation"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"github.com/xdg-go/scram"
 	"go.uber.org/zap"
 )
 
@@ -123,7 +131,12 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		ProviderBudget: limiter,
 		ClaimFor:       30 * time.Second,
 	})
-	webhookDispatcher := moderation.NewWebhookDispatcherWithSecretResolver(store, newRuntimeSecrets(cfg.APIClients, cfg.WebhookSecrets), moderation.NetWebhookClient{Client: http.DefaultClient})
+	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
+	defer cancelRuntime()
+	var consumerFailed atomic.Bool
+	var consumerErr atomic.Value
+
+	webhookDispatcher := moderation.NewWebhookDispatcherWithSecretResolver(store, newRuntimeSecrets(cfg.APIClients, cfg.WebhookSecrets), moderation.NetWebhookClient{Client: &http.Client{Timeout: timeoutMs(cfg.Server.WriteTimeoutMs, 10*time.Second)}})
 	server, err := httpapi.NewServer(httpapi.Config{
 		Store:            store,
 		Provider:         aliClient,
@@ -138,6 +151,12 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 			if err := redisClient.Ping(readyCtx).Err(); err != nil {
 				return err
 			}
+			if consumerFailed.Load() {
+				if value := consumerErr.Load(); value != nil {
+					return fmt.Errorf("task consumer stopped: %v", value)
+				}
+				return fmt.Errorf("task consumer stopped")
+			}
 			_, err := clusterAdmin.DescribeTopics([]string{moderation.TopicModerationTasksV1, moderation.TopicModerationTaskDLQ})
 			return err
 		},
@@ -146,32 +165,49 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		return err
 	}
 
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(1)
 	go func() {
-		if err := moderation.RunTaskConsumerGroup(ctx, consumerGroup, worker); err != nil {
+		defer wg.Done()
+		if err := moderation.RunTaskConsumerGroup(runtimeCtx, consumerGroup, worker, publisher); err != nil && runtimeCtx.Err() == nil {
+			consumerFailed.Store(true)
+			consumerErr.Store(err.Error())
 			logger.Error("moderation task consumer stopped", zap.Error(err))
+			select {
+			case errCh <- err:
+			default:
+			}
 		}
 	}()
-	go runEvery(ctx, 500*time.Millisecond, func(loopCtx context.Context) {
+	startLoop := func(interval time.Duration, fn func(context.Context)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runEvery(runtimeCtx, interval, fn)
+		}()
+	}
+	startLoop(500*time.Millisecond, func(loopCtx context.Context) {
 		if err := moderation.PublishTaskOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
 			logger.Error("publish task outbox failed", zap.Error(err))
 		}
 	})
-	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+	startLoop(time.Second, func(loopCtx context.Context) {
 		if _, err := moderation.RequeueDueRetries(loopCtx, store, 100); err != nil {
 			logger.Error("requeue moderation retry failed", zap.Error(err))
 		}
 	})
-	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+	startLoop(time.Second, func(loopCtx context.Context) {
 		if err := moderation.PublishDLQOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
 			logger.Error("publish dlq outbox failed", zap.Error(err))
 		}
 	})
-	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+	startLoop(time.Second, func(loopCtx context.Context) {
 		if err := webhookDispatcher.DispatchDueWebhooks(loopCtx, 100); err != nil {
 			logger.Error("dispatch webhook failed", zap.Error(err))
 		}
 	})
-	go runEvery(ctx, time.Hour, func(loopCtx context.Context) {
+	startLoop(time.Hour, func(loopCtx context.Context) {
 		_, err := store.CleanupExpiredWithError(loopCtx, 30*24*time.Hour, 500)
 		if err != nil {
 			logger.Error("cleanup expired moderation metadata failed", zap.Error(err))
@@ -186,7 +222,6 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		WriteTimeout:      timeoutMs(cfg.Server.WriteTimeoutMs, 10*time.Second),
 		IdleTimeout:       timeoutMs(cfg.Server.IdleTimeoutMs, time.Minute),
 	}
-	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("moderation HTTP service listening", zap.String("addr", cfg.Server.Addr))
 		errCh <- httpServer.ListenAndServe()
@@ -194,10 +229,18 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 
 	select {
 	case <-ctx.Done():
+		cancelRuntime()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return httpServer.Shutdown(shutdownCtx)
+		err := httpServer.Shutdown(shutdownCtx)
+		wg.Wait()
+		return err
 	case err := <-errCh:
+		cancelRuntime()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+		wg.Wait()
 		if err == http.ErrServerClosed {
 			return nil
 		}
@@ -213,14 +256,156 @@ func newSaramaConfig(cfg config.KafkaConfig) (*sarama.Config, error) {
 	saramaCfg := sarama.NewConfig()
 	saramaCfg.Version = version
 	saramaCfg.ClientID = "post-audit-pro-moderation"
-	saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
-	saramaCfg.Producer.Return.Successes = true
-	saramaCfg.Producer.Return.Errors = true
-	saramaCfg.Producer.Idempotent = true
-	saramaCfg.Net.MaxOpenRequests = 1
-	saramaCfg.Consumer.Offsets.AutoCommit.Enable = cfg.Consumer.Offsets.AutoCommitEnable
-	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	if err := applyKafkaSecurity(saramaCfg, cfg); err != nil {
+		return nil, err
+	}
+	if err := applyKafkaProducer(saramaCfg, cfg.Producer); err != nil {
+		return nil, err
+	}
+	applyKafkaConsumer(saramaCfg, cfg.Consumer)
+	if err := saramaCfg.Validate(); err != nil {
+		return nil, err
+	}
 	return saramaCfg, nil
+}
+
+func applyKafkaSecurity(saramaCfg *sarama.Config, cfg config.KafkaConfig) error {
+	if cfg.EnableTLS {
+		tlsCfg, err := buildTLSConfig(cfg)
+		if err != nil {
+			return err
+		}
+		saramaCfg.Net.TLS.Enable = true
+		saramaCfg.Net.TLS.Config = tlsCfg
+	}
+	if !cfg.EnableSASL {
+		return nil
+	}
+	if cfg.SASLUser == "" || cfg.SASLPassword == "" {
+		return fmt.Errorf("kafka sasl_user and sasl_password are required when SASL is enabled")
+	}
+	saramaCfg.Net.SASL.Enable = true
+	saramaCfg.Net.SASL.User = cfg.SASLUser
+	saramaCfg.Net.SASL.Password = cfg.SASLPassword
+	switch strings.ToUpper(cfg.SASLMechanism) {
+	case "", "PLAIN":
+		saramaCfg.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+	case "SCRAM-SHA-256", "SCRAM256":
+		saramaCfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+		saramaCfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+			return &xdgSCRAMClient{hash: scram.SHA256}
+		}
+	case "SCRAM-SHA-512", "SCRAM512":
+		saramaCfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+		saramaCfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient {
+			return &xdgSCRAMClient{hash: scram.SHA512}
+		}
+	default:
+		return fmt.Errorf("unsupported kafka sasl mechanism %q", cfg.SASLMechanism)
+	}
+	return nil
+}
+
+func buildTLSConfig(cfg config.KafkaConfig) (*tls.Config, error) {
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.TLSInsecureSkipVerify}
+	if cfg.TLSCaFile != "" {
+		caPEM, err := os.ReadFile(cfg.TLSCaFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("kafka tls_ca_file contains no PEM certificates")
+		}
+		tlsCfg.RootCAs = pool
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return nil, fmt.Errorf("kafka tls_cert_file and tls_key_file must be configured together")
+	}
+	if cfg.TLSCertFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCertFile, cfg.TLSKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+	return tlsCfg, nil
+}
+
+func applyKafkaProducer(saramaCfg *sarama.Config, cfg config.ProducerConfig) error {
+	switch cfg.RequiredAcks {
+	case "", "wait_for_all":
+		saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
+		saramaCfg.Producer.Idempotent = true
+		saramaCfg.Net.MaxOpenRequests = 1
+	case "wait_for_local":
+		saramaCfg.Producer.RequiredAcks = sarama.WaitForLocal
+	case "no_response":
+		return fmt.Errorf("kafka producer required_acks=no_response is not supported for sync publishing")
+	default:
+		return fmt.Errorf("unsupported kafka producer required_acks %q", cfg.RequiredAcks)
+	}
+	saramaCfg.Producer.Return.Successes = cfg.ReturnSuccesses
+	saramaCfg.Producer.Return.Errors = cfg.ReturnErrors
+	if cfg.TimeoutMs > 0 {
+		saramaCfg.Producer.Timeout = cfg.TimeoutMs * time.Millisecond
+	}
+	if cfg.MaxMessageBytes > 0 {
+		saramaCfg.Producer.MaxMessageBytes = cfg.MaxMessageBytes
+	}
+	return nil
+}
+
+func applyKafkaConsumer(saramaCfg *sarama.Config, cfg config.ConsumerConfig) {
+	saramaCfg.Consumer.Offsets.AutoCommit.Enable = cfg.Offsets.AutoCommitEnable
+	if cfg.Offsets.AutoCommitIntervalMs > 0 {
+		saramaCfg.Consumer.Offsets.AutoCommit.Interval = cfg.Offsets.AutoCommitIntervalMs * time.Millisecond
+	}
+	if cfg.SessionTimeoutMs > 0 {
+		saramaCfg.Consumer.Group.Session.Timeout = cfg.SessionTimeoutMs * time.Millisecond
+	}
+	if cfg.HeartbeatIntervalMs > 0 {
+		saramaCfg.Consumer.Group.Heartbeat.Interval = cfg.HeartbeatIntervalMs * time.Millisecond
+	}
+	switch strings.ToLower(firstNonEmpty(cfg.Offsets.Initial, cfg.AutoOffsetReset)) {
+	case "latest":
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	default:
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+type xdgSCRAMClient struct {
+	hash         scram.HashGeneratorFcn
+	client       *scram.Client
+	conversation *scram.ClientConversation
+}
+
+func (c *xdgSCRAMClient) Begin(userName, password, authzID string) error {
+	client, err := c.hash.NewClient(userName, password, authzID)
+	if err != nil {
+		return err
+	}
+	c.client = client
+	c.conversation = client.NewConversation()
+	return nil
+}
+
+func (c *xdgSCRAMClient) Step(challenge string) (string, error) {
+	return c.conversation.Step(challenge)
+}
+
+func (c *xdgSCRAMClient) Done() bool {
+	return c.conversation.Done()
 }
 
 func runEvery(ctx context.Context, interval time.Duration, fn func(context.Context)) {

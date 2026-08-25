@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +161,87 @@ func TestPublicAuthScopesStrictJSONAndSyncProviderBudget(t *testing.T) {
 	}
 }
 
+func TestPublicRequestDTOsRejectWebhookOutsideTopLevelAsyncAndBatch(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+
+	syncWebhook := doJSON(server, http.MethodPost, "/api/v1/moderations:check", "test-token", nil, `{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"hello","webhook_url":"https://hooks.example.com/moderation"}`)
+	if syncWebhook.Code != http.StatusBadRequest || !strings.Contains(syncWebhook.Body.String(), `"invalid_request"`) {
+		t.Fatalf("sync webhook_url response = %d %s, want 400 invalid_request", syncWebhook.Code, syncWebhook.Body.String())
+	}
+
+	itemWebhook := doJSON(server, http.MethodPost, "/api/v1/moderation-batches", "test-token", map[string]string{"Idempotency-Key": "batch-with-item-hook"}, `{"items":[{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"hello","webhook_url":"https://hooks.example.com/moderation"}]}`)
+	if itemWebhook.Code != http.StatusBadRequest || !strings.Contains(itemWebhook.Body.String(), `"invalid_request"`) {
+		t.Fatalf("batch item webhook_url response = %d %s, want 400 invalid_request", itemWebhook.Code, itemWebhook.Body.String())
+	}
+
+	asyncWebhook := doJSON(server, http.MethodPost, "/api/v1/moderation-tasks", "test-token", map[string]string{"Idempotency-Key": "task-with-hook"}, `{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"hello","webhook_url":"https://hooks.example.com/moderation"}`)
+	if asyncWebhook.Code != http.StatusAccepted {
+		t.Fatalf("top-level async webhook_url response = %d %s, want 202", asyncWebhook.Code, asyncWebhook.Body.String())
+	}
+}
+
+func TestProviderFailureAndBodyLimitMatchOpenAPI(t *testing.T) {
+	server, _, provider, _ := newTestServer(t)
+	provider.err = &auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Message: "upstream request detail"}
+
+	failed := doJSON(server, http.MethodPost, "/api/v1/moderations:check", "test-token", nil, `{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"hello"}`)
+	if failed.Code != http.StatusBadGateway || !strings.Contains(failed.Body.String(), `"provider_failure"`) || strings.Contains(failed.Body.String(), "upstream request detail") {
+		t.Fatalf("provider failure response = %d %s, want sanitized 502 provider_failure", failed.Code, failed.Body.String())
+	}
+
+	openapi := doJSON(server, http.MethodGet, "/openapi.json", "", nil, "")
+	if !strings.Contains(openapi.Body.String(), `"502"`) || !strings.Contains(openapi.Body.String(), "1048576") {
+		t.Fatalf("OpenAPI must document 502 and 1048576-byte body limit: %s", openapi.Body.String())
+	}
+
+	large := largestValidBatchJSON(100, 2000)
+	provider.err = nil
+	accepted := doJSON(server, http.MethodPost, "/api/v1/moderation-batches", "test-token", map[string]string{"Idempotency-Key": "large-batch"}, large)
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("largest valid batch status = %d, want 202 body-len=%d body=%s", accepted.Code, len(large), accepted.Body.String())
+	}
+}
+
+func TestInvalidCursorAndLimitAreInvalidRequest(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+	submitted := doJSON(server, http.MethodPost, "/api/v1/moderation-batches", "test-token", map[string]string{"Idempotency-Key": "batch-invalid-page"}, `{"items":[{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"hello"}]}`)
+	var body map[string]interface{}
+	_ = json.Unmarshal(submitted.Body.Bytes(), &body)
+	batchID := body["batch_id"].(string)
+
+	for _, path := range []string{
+		"/api/v1/moderation-batches/" + batchID + "/items?cursor=not-base64",
+		"/api/v1/moderation-batches/" + batchID + "/items?limit=0",
+		"/api/v1/moderation-batches/" + batchID + "/items?limit=101",
+		"/internal/v1/moderation/tasks?cursor=not-base64",
+		"/internal/v1/moderation/batches?limit=abc",
+	} {
+		token := "test-token"
+		if strings.HasPrefix(path, "/internal/") {
+			token = "admin-token"
+		}
+		got := doJSON(server, http.MethodGet, path, token, nil, "")
+		if got.Code != http.StatusBadRequest || !strings.Contains(got.Body.String(), `"invalid_request"`) {
+			t.Fatalf("%s response = %d %s, want 400 invalid_request", path, got.Code, got.Body.String())
+		}
+	}
+}
+
+func TestClientTokenMatchingChecksAllDigests(t *testing.T) {
+	clients := []ClientConfig{
+		{ID: "first", TokenSHA256: sha256Hex("first")},
+		{ID: "second", TokenSHA256: sha256Hex("second")},
+		{ID: "third", TokenSHA256: sha256Hex("third")},
+	}
+	matched, ok, comparisons := matchClientToken("first", clients)
+	if !ok || matched.ID != "first" {
+		t.Fatalf("match first token: client=%#v ok=%v", matched, ok)
+	}
+	if comparisons != len(clients) {
+		t.Fatalf("token matching compared %d digests, want %d", comparisons, len(clients))
+	}
+}
+
 func TestAsyncIdempotencyReplayConflictOwnershipAndNoRawContent(t *testing.T) {
 	server, _, _, _ := newTestServer(t)
 	body := `{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"sensitive"}`
@@ -252,6 +334,14 @@ func TestBatchCursorPaginationInternalStatsReadinessAndOpenAPI(t *testing.T) {
 	if filteredBatches.Code != http.StatusOK || !strings.Contains(filteredBatches.Body.String(), batchID) {
 		t.Fatalf("admin filtered batches = %d %s, want batch with matching image member", filteredBatches.Code, filteredBatches.Body.String())
 	}
+	internalItemsNoAuth := doJSON(server, http.MethodGet, "/internal/v1/moderation/batches/"+batchID+"/items", "", nil, "")
+	if internalItemsNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("internal batch items without admin auth = %d, want 401", internalItemsNoAuth.Code)
+	}
+	internalItems := doJSON(server, http.MethodGet, "/internal/v1/moderation/batches/"+batchID+"/items?limit=1", "admin-token", nil, "")
+	if internalItems.Code != http.StatusOK || !strings.Contains(internalItems.Body.String(), `"next_cursor"`) || strings.Contains(internalItems.Body.String(), "https://cdn.example.com") {
+		t.Fatalf("internal batch items = %d %s, want paginated details without raw URL", internalItems.Code, internalItems.Body.String())
+	}
 
 	openapi := doJSON(server, http.MethodGet, "/openapi.json", "", nil, "")
 	if openapi.Code != http.StatusOK {
@@ -260,6 +350,15 @@ func TestBatchCursorPaginationInternalStatsReadinessAndOpenAPI(t *testing.T) {
 	if err := AssertOpenAPIParity(server.Handler(), openapi.Body.Bytes()); err != nil {
 		t.Fatalf("openapi parity: %v", err)
 	}
+}
+
+func largestValidBatchJSON(count, runesPerItem int) string {
+	text := strings.Repeat("😀", runesPerItem)
+	items := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		items = append(items, `{"client_item_id":"post-`+strconv.Itoa(i)+`","content_type":"text","policy":"text.general","text":"`+text+`"}`)
+	}
+	return `{"items":[` + strings.Join(items, ",") + `]}`
 }
 
 func firstTaskIDFromPage(t *testing.T, data []byte) string {

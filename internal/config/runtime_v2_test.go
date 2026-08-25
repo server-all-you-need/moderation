@@ -15,9 +15,6 @@ kafka:
   brokers: ["kafka:9092"]
   version: "2.8.1"
   consumer_group_id: "moderation-worker"
-  topics:
-    moderation_tasks: "moderation_tasks_v1"
-    moderation_dlq: "moderation_tasks_dlq_v1"
   producer:
     required_acks: "wait_for_all"
     timeout_ms: 5000
@@ -49,9 +46,6 @@ webhook_secrets:
 	if cfg.Server.Addr != ":8080" {
 		t.Fatalf("server addr = %q", cfg.Server.Addr)
 	}
-	if cfg.Kafka.Topics.ModerationTasks != "moderation_tasks_v1" || cfg.Kafka.Topics.ModerationDLQ != "moderation_tasks_dlq_v1" {
-		t.Fatalf("decoded wrong moderation topics: %#v", cfg.Kafka.Topics)
-	}
 	if cfg.AliyunAudit.EndpointOrDefault() != "green-cip.cn-shanghai.aliyuncs.com" {
 		t.Fatalf("default aliyun endpoint = %q", cfg.AliyunAudit.EndpointOrDefault())
 	}
@@ -71,8 +65,6 @@ func TestV2RuntimeConfigValidationRejectsMissingProductionDependencies(t *testin
 	cfg.Kafka.Brokers = []string{"kafka:9092"}
 	cfg.Kafka.Version = "2.8.1"
 	cfg.Kafka.ConsumerGroupID = "moderation-worker"
-	cfg.Kafka.Topics.ModerationTasks = "moderation_tasks_v1"
-	cfg.Kafka.Topics.ModerationDLQ = "moderation_tasks_dlq_v1"
 	cfg.Kafka.Producer.ReturnSuccesses = true
 	cfg.Kafka.Producer.ReturnErrors = true
 	cfg.AliyunAudit.AccessKeyID = "placeholder"

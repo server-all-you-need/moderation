@@ -58,7 +58,9 @@ type AdminStatsSnapshot struct {
 	RiskCounts           map[string]int `json:"risk_counts"`
 	KafkaConsumerLag     int64          `json:"kafka_consumer_lag"`
 	PendingTaskOutbox    int            `json:"pending_task_outbox"`
+	ClaimedTaskOutbox    int            `json:"claimed_task_outbox"`
 	PendingWebhookOutbox int            `json:"pending_webhook_outbox"`
+	ClaimedWebhookOutbox int            `json:"claimed_webhook_outbox"`
 	PendingDLQOutbox     int            `json:"pending_dlq_outbox"`
 	PublishedDLQOutbox   int            `json:"published_dlq_outbox"`
 }
@@ -154,9 +156,24 @@ func (s *MemoryStore) ListBatchItems(_ context.Context, callerID, batchID string
 	return BatchItemsPage{Items: items, NextCursor: next}, nil
 }
 
+func (s *MemoryStore) ListAdminBatchItems(_ context.Context, batchID string, cursor BatchItemCursor) (BatchItemsPage, error) {
+	limit := normalizeListLimit(cursor.Limit)
+	offset, err := decodePositionCursor(cursor.Cursor)
+	if err != nil {
+		return BatchItemsPage{}, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.batches[batchID]; !ok {
+		return BatchItemsPage{}, ErrNotFound
+	}
+	return s.listBatchItemsLocked(batchID, offset, limit), nil
+}
+
 func (s *MemoryStore) ListTasks(_ context.Context, filter ListFilter) (TaskPage, error) {
 	limit := normalizeListLimit(filter.Limit)
-	offset, err := decodePositionCursor(filter.Cursor)
+	cursor, err := decodeKeysetCursor(filter.Cursor)
 	if err != nil {
 		return TaskPage{}, err
 	}
@@ -175,24 +192,25 @@ func (s *MemoryStore) ListTasks(_ context.Context, filter ListFilter) (TaskPage,
 		}
 		return items[i].UpdatedAt.After(items[j].UpdatedAt)
 	})
-	if offset >= len(items) {
-		return TaskPage{}, nil
+	if cursor != nil {
+		filtered := items[:0]
+		for _, item := range items {
+			if item.UpdatedAt.Before(cursor.UpdatedAt) || (item.UpdatedAt.Equal(cursor.UpdatedAt) && item.ID < cursor.ID) {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
 	}
-	end := offset + limit
-	if end > len(items) {
-		end = len(items)
+	if len(items) > limit {
+		nextItem := items[limit-1]
+		return TaskPage{Items: items[:limit], NextCursor: encodeKeysetCursor(nextItem.UpdatedAt, nextItem.ID)}, nil
 	}
-	page := items[offset:end]
-	next := ""
-	if end < len(items) {
-		next = encodePositionCursor(end)
-	}
-	return TaskPage{Items: page, NextCursor: next}, nil
+	return TaskPage{Items: items, NextCursor: ""}, nil
 }
 
 func (s *MemoryStore) ListBatches(_ context.Context, filter ListFilter) (BatchPage, error) {
 	limit := normalizeListLimit(filter.Limit)
-	offset, err := decodePositionCursor(filter.Cursor)
+	cursor, err := decodeKeysetCursor(filter.Cursor)
 	if err != nil {
 		return BatchPage{}, err
 	}
@@ -217,19 +235,20 @@ func (s *MemoryStore) ListBatches(_ context.Context, filter ListFilter) (BatchPa
 		}
 		return items[i].UpdatedAt.After(items[j].UpdatedAt)
 	})
-	if offset >= len(items) {
-		return BatchPage{}, nil
+	if cursor != nil {
+		filtered := items[:0]
+		for _, item := range items {
+			if item.UpdatedAt.Before(cursor.UpdatedAt) || (item.UpdatedAt.Equal(cursor.UpdatedAt) && item.ID < cursor.ID) {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
 	}
-	end := offset + limit
-	if end > len(items) {
-		end = len(items)
+	if len(items) > limit {
+		nextItem := items[limit-1]
+		return BatchPage{Items: items[:limit], NextCursor: encodeKeysetCursor(nextItem.UpdatedAt, nextItem.ID)}, nil
 	}
-	page := items[offset:end]
-	next := ""
-	if end < len(items) {
-		next = encodePositionCursor(end)
-	}
-	return BatchPage{Items: page, NextCursor: next}, nil
+	return BatchPage{Items: items, NextCursor: ""}, nil
 }
 
 func (s *MemoryStore) batchMatchesMemberFilterLocked(batchID string, filter ListFilter) bool {
@@ -285,12 +304,20 @@ func (s *MemoryStore) AdminStats(context.Context) (AdminStatsSnapshot, error) {
 	}
 	for _, row := range s.outbox {
 		if row.PublishedAt == nil {
-			stats.PendingTaskOutbox++
+			if row.ClaimedUntil != nil && row.ClaimedUntil.After(s.now) {
+				stats.ClaimedTaskOutbox++
+			} else {
+				stats.PendingTaskOutbox++
+			}
 		}
 	}
 	for _, row := range s.webhookRows {
 		if row.DeliveredAt == nil {
-			stats.PendingWebhookOutbox++
+			if row.ClaimedUntil != nil && row.ClaimedUntil.After(s.now) {
+				stats.ClaimedWebhookOutbox++
+			} else {
+				stats.PendingWebhookOutbox++
+			}
 		}
 	}
 	for _, row := range s.dlqOutbox {
@@ -303,6 +330,28 @@ func (s *MemoryStore) AdminStats(context.Context) (AdminStatsSnapshot, error) {
 	return stats, nil
 }
 
+func (s *MemoryStore) listBatchItemsLocked(batchID string, offset, limit int) BatchItemsPage {
+	ids := s.batchTasks[batchID]
+	if offset >= len(ids) {
+		return BatchItemsPage{}
+	}
+	end := offset + limit
+	if end > len(ids) {
+		end = len(ids)
+	}
+	items := make([]Task, 0, end-offset)
+	for _, id := range ids[offset:end] {
+		if task, ok := s.tasks[id]; ok {
+			items = append(items, cloneTask(task))
+		}
+	}
+	next := ""
+	if end < len(ids) {
+		next = encodePositionCursor(end)
+	}
+	return BatchItemsPage{Items: items, NextCursor: next}
+}
+
 func encodePositionCursor(offset int) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("pos:%d", offset)))
 }
@@ -313,17 +362,45 @@ func decodePositionCursor(cursor string) (int, error) {
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return 0, fmt.Errorf("invalid cursor")
+		return 0, ErrInvalidCursor
 	}
 	text := string(raw)
 	if !strings.HasPrefix(text, "pos:") {
-		return 0, fmt.Errorf("invalid cursor")
+		return 0, ErrInvalidCursor
 	}
 	offset, err := strconv.Atoi(strings.TrimPrefix(text, "pos:"))
 	if err != nil || offset < 0 {
-		return 0, fmt.Errorf("invalid cursor")
+		return 0, ErrInvalidCursor
 	}
 	return offset, nil
+}
+
+type keysetCursor struct {
+	UpdatedAt time.Time
+	ID        string
+}
+
+func encodeKeysetCursor(updatedAt time.Time, id string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("ks:%d:%s", updatedAt.UnixNano(), id)))
+}
+
+func decodeKeysetCursor(cursor string) (*keysetCursor, error) {
+	if cursor == "" {
+		return nil, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return nil, ErrInvalidCursor
+	}
+	parts := strings.SplitN(string(raw), ":", 3)
+	if len(parts) != 3 || parts[0] != "ks" || parts[2] == "" {
+		return nil, ErrInvalidCursor
+	}
+	nanos, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil, ErrInvalidCursor
+	}
+	return &keysetCursor{UpdatedAt: time.Unix(0, nanos).UTC(), ID: parts[2]}, nil
 }
 
 func normalizeListLimit(limit int) int {

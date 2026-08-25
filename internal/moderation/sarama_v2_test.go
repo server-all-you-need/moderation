@@ -3,6 +3,7 @@ package moderation
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func TestSaramaPublisherWritesTaskIDOnlyModerationEvents(t *testing.T) {
 	producer := &recordingSyncProducer{}
 	publisher := NewSaramaPublisher(producer)
 
-	value, err := MarshalTaskEvent(TaskEvent{Version: 1, TaskID: "task-1", CallerID: "client-a", ClientItemID: "post-1", ContentType: "text", Policy: "text.general", CorrelationID: "corr-1"})
+	value, err := MarshalTaskEvent(TaskEvent{Version: 1, TaskID: "task-1"})
 	if err != nil {
 		t.Fatalf("marshal task event: %v", err)
 	}
@@ -63,13 +64,28 @@ func TestSaramaPublisherWritesTaskIDOnlyModerationEvents(t *testing.T) {
 	if err := json.Unmarshal(encoded, &event); err != nil {
 		t.Fatalf("unmarshal published value: %v", err)
 	}
-	for _, forbidden := range []string{"text", "image_url", "content", "body"} {
+	for _, forbidden := range []string{"caller_id", "batch_id", "client_item_id", "content_type", "policy", "correlation_id", "text", "image_url", "content", "body"} {
 		if _, ok := event[forbidden]; ok {
 			t.Fatalf("published task event leaked %s: %s", forbidden, string(encoded))
 		}
 	}
-	if event["task_id"] != "task-1" || event["caller_id"] != "client-a" {
+	if len(event) != 2 || event["task_id"] != "task-1" || event["version"].(float64) != 1 {
 		t.Fatalf("unexpected task event: %s", string(encoded))
+	}
+}
+
+func TestTaskConsumerStrictlyRejectsNonMinimalEvents(t *testing.T) {
+	worker := NewWorkerWithOptions(WorkerOptions{Store: NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)), Provider: &countingProvider{}, ProviderBudget: allowAllProviderBudget{}})
+	consumer := NewTaskConsumer(worker)
+
+	for _, payload := range [][]byte{
+		[]byte(`{"version":1}`),
+		[]byte(`{"version":2,"task_id":"task-1"}`),
+		[]byte(`{"version":1,"task_id":"task-1","caller_id":"client-a"}`),
+	} {
+		if err := consumer.ProcessMessage(context.Background(), payload); !errors.Is(err, ErrInvalidTaskEvent) {
+			t.Fatalf("ProcessMessage(%s) err=%v, want ErrInvalidTaskEvent", string(payload), err)
+		}
 	}
 }
 

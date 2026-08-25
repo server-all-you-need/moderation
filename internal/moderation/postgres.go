@@ -458,7 +458,11 @@ func (s *PostgresStore) ScheduleTaskRetry(ctx context.Context, taskID string, de
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'queued', next_attempt_at = $1, claimed_until = null, error_json = $2, updated_at = $3 where id = $4 and status = 'processing'`, s.now().Add(delay), []byte(fmt.Sprintf(`{"code":"provider_temporary","message":%q}`, message)), s.now(), taskID); err != nil {
+	errorBody, marshalErr := json.Marshal(retryTaskError(message))
+	if marshalErr != nil {
+		return marshalErr
+	}
+	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'queued', next_attempt_at = $1, claimed_until = null, error_json = $2, updated_at = $3 where id = $4 and status = 'processing'`, s.now().Add(delay), errorBody, s.now(), taskID); err != nil {
 		return err
 	}
 	if batchID != "" {

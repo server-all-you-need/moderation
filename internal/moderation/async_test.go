@@ -92,8 +92,17 @@ func TestTaskEventSerializationContainsOnlyNonSensitiveTaskMetadata(t *testing.T
 	if err := json.Unmarshal(value, &event); err != nil {
 		t.Fatalf("unmarshal task event: %v", err)
 	}
-	if event.Version != 1 || event.TaskID != task.ID || event.CallerID != "client-a" || event.ClientItemID != "post-1" {
+	if event.Version != 1 || event.TaskID != task.ID {
 		t.Fatalf("unexpected event metadata: %#v", event)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		t.Fatalf("unmarshal raw event: %v", err)
+	}
+	for _, forbiddenKey := range []string{"caller_id", "batch_id", "client_item_id", "content_type", "policy", "correlation_id"} {
+		if _, ok := raw[forbiddenKey]; ok {
+			t.Fatalf("task event must contain only version and task_id, got %s", string(value))
+		}
 	}
 	for _, forbidden := range []string{"secret source text", "api-key", "provider-secret", "webhook-secret"} {
 		if strings.Contains(string(value), forbidden) {

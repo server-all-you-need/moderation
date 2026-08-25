@@ -87,6 +87,10 @@ func (s *PostgresStore) ListBatchItems(ctx context.Context, callerID, batchID st
 	if err != nil {
 		return BatchItemsPage{}, err
 	}
+	return s.listBatchItems(ctx, batchID, offset, limit)
+}
+
+func (s *PostgresStore) listBatchItems(ctx context.Context, batchID string, offset, limit int) (BatchItemsPage, error) {
 	rows, err := s.db.QueryContext(ctx, `
 select t.id, t.caller_id, coalesce(t.batch_id::text, ''), t.client_item_id, t.content_type, t.policy, t.status,
        t.result_json, t.error_json, t.attempts, t.correlation_id, coalesce(t.webhook_url, ''),
@@ -120,22 +124,39 @@ limit $3`, batchID, offset, limit+1)
 	return BatchItemsPage{Items: items, NextCursor: next}, nil
 }
 
+func (s *PostgresStore) ListAdminBatchItems(ctx context.Context, batchID string, cursor BatchItemCursor) (BatchItemsPage, error) {
+	limit := normalizeListLimit(cursor.Limit)
+	offset, err := decodePositionCursor(cursor.Cursor)
+	if err != nil {
+		return BatchItemsPage{}, err
+	}
+	var exists int
+	err = s.db.QueryRowContext(ctx, `select 1 from moderation_batches where id = $1`, batchID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BatchItemsPage{}, ErrNotFound
+	}
+	if err != nil {
+		return BatchItemsPage{}, err
+	}
+	return s.listBatchItems(ctx, batchID, offset, limit)
+}
+
 func (s *PostgresStore) ListTasks(ctx context.Context, filter ListFilter) (TaskPage, error) {
 	limit := normalizeListLimit(filter.Limit)
-	offset, err := decodePositionCursor(filter.Cursor)
+	cursor, err := decodeKeysetCursor(filter.Cursor)
 	if err != nil {
 		return TaskPage{}, err
 	}
 	where, args := taskFilterSQL(filter)
-	args = append(args, offset, limit+1)
+	where = appendTaskKeysetSQL(where, &args, cursor)
+	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, `
 select id, caller_id, coalesce(batch_id::text, ''), client_item_id, content_type, policy, status,
-       result_json, error_json, attempts, correlation_id, coalesce(webhook_url, ''),
-       created_at, updated_at, terminal_at, row_number() over (order by updated_at desc, id desc)::int - 1 as pos
+       result_json, error_json, attempts, correlation_id, coalesce(webhook_url, ''), created_at, updated_at, terminal_at, 0
 from moderation_tasks
 `+where+`
 order by updated_at desc, id desc
-offset $`+strconvArg(len(args)-1)+` limit $`+strconvArg(len(args)), args...)
+limit $`+strconvArg(len(args)), args...)
 	if err != nil {
 		return TaskPage{}, err
 	}
@@ -149,7 +170,7 @@ offset $`+strconvArg(len(args)-1)+` limit $`+strconvArg(len(args)), args...)
 			return TaskPage{}, err
 		}
 		if len(items) == limit {
-			next = encodePositionCursor(position)
+			next = encodeKeysetCursor(items[len(items)-1].UpdatedAt, items[len(items)-1].ID)
 			continue
 		}
 		items = append(items, task)
@@ -159,19 +180,20 @@ offset $`+strconvArg(len(args)-1)+` limit $`+strconvArg(len(args)), args...)
 
 func (s *PostgresStore) ListBatches(ctx context.Context, filter ListFilter) (BatchPage, error) {
 	limit := normalizeListLimit(filter.Limit)
-	offset, err := decodePositionCursor(filter.Cursor)
+	cursor, err := decodeKeysetCursor(filter.Cursor)
 	if err != nil {
 		return BatchPage{}, err
 	}
 	where, args := batchFilterSQL(filter)
-	args = append(args, offset, limit+1)
+	where = appendBatchKeysetSQL(where, &args, cursor)
+	args = append(args, limit+1)
 	rows, err := s.db.QueryContext(ctx, `
 select id, caller_id, status, total_count, queued_count, processing_count, succeeded_count, failed_count,
-       coalesce(webhook_url, ''), created_at, updated_at, terminal_at, row_number() over (order by updated_at desc, id desc)::int - 1 as pos
+       coalesce(webhook_url, ''), created_at, updated_at, terminal_at, 0
 from moderation_batches
 `+where+`
 order by updated_at desc, id desc
-offset $`+strconvArg(len(args)-1)+` limit $`+strconvArg(len(args)), args...)
+limit $`+strconvArg(len(args)), args...)
 	if err != nil {
 		return BatchPage{}, err
 	}
@@ -191,7 +213,7 @@ offset $`+strconvArg(len(args)-1)+` limit $`+strconvArg(len(args)), args...)
 			batch.TerminalAt = &terminal.Time
 		}
 		if len(items) == limit {
-			next = encodePositionCursor(position)
+			next = encodeKeysetCursor(items[len(items)-1].UpdatedAt, items[len(items)-1].ID)
 			continue
 		}
 		items = append(items, batch)
@@ -222,6 +244,7 @@ func (s *PostgresStore) ListAPIClients(ctx context.Context) ([]APIClient, error)
 
 func (s *PostgresStore) AdminStats(ctx context.Context) (AdminStatsSnapshot, error) {
 	stats := AdminStatsSnapshot{TaskStatusCounts: map[string]int{}, BatchStatusCounts: map[string]int{}, RiskCounts: map[string]int{}}
+	var err error
 	if err := scanCountRows(ctx, s.db, `select status, count(*) from moderation_tasks group by status`, stats.TaskStatusCounts); err != nil {
 		return stats, err
 	}
@@ -231,10 +254,24 @@ func (s *PostgresStore) AdminStats(ctx context.Context) (AdminStatsSnapshot, err
 	if err := scanCountRows(ctx, s.db, `select result_json->>'risk_level', count(*) from moderation_tasks where result_json is not null group by result_json->>'risk_level'`, stats.RiskCounts); err != nil {
 		return stats, err
 	}
-	_ = s.db.QueryRowContext(ctx, `select count(*) from moderation_task_outbox where published_at is null`).Scan(&stats.PendingTaskOutbox)
-	_ = s.db.QueryRowContext(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null`).Scan(&stats.PendingWebhookOutbox)
-	_ = s.db.QueryRowContext(ctx, `select count(*) from moderation_dlq_outbox where published_at is null`).Scan(&stats.PendingDLQOutbox)
-	_ = s.db.QueryRowContext(ctx, `select count(*) from moderation_dlq_outbox where published_at is not null`).Scan(&stats.PublishedDLQOutbox)
+	if stats.PendingTaskOutbox, err = s.count(ctx, `select count(*) from moderation_task_outbox where published_at is null and (claimed_until is null or claimed_until < now())`); err != nil {
+		return stats, err
+	}
+	if stats.ClaimedTaskOutbox, err = s.count(ctx, `select count(*) from moderation_task_outbox where published_at is null and claimed_until >= now()`); err != nil {
+		return stats, err
+	}
+	if stats.PendingWebhookOutbox, err = s.count(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null and next_attempt_at <= now() and (claimed_until is null or claimed_until < now())`); err != nil {
+		return stats, err
+	}
+	if stats.ClaimedWebhookOutbox, err = s.count(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null and claimed_until >= now()`); err != nil {
+		return stats, err
+	}
+	if stats.PendingDLQOutbox, err = s.count(ctx, `select count(*) from moderation_dlq_outbox where published_at is null`); err != nil {
+		return stats, err
+	}
+	if stats.PublishedDLQOutbox, err = s.count(ctx, `select count(*) from moderation_dlq_outbox where published_at is not null`); err != nil {
+		return stats, err
+	}
 	return stats, nil
 }
 
@@ -359,6 +396,39 @@ func batchFilterSQL(filter ListFilter) (string, []interface{}) {
 		return "", args
 	}
 	return "where " + strings.Join(clauses, " and "), args
+}
+
+func appendTaskKeysetSQL(where string, args *[]interface{}, cursor *keysetCursor) string {
+	if cursor == nil {
+		return where
+	}
+	*args = append(*args, cursor.UpdatedAt, cursor.ID)
+	clause := fmt.Sprintf("(updated_at, id) < ($%d, $%d)", len(*args)-1, len(*args))
+	return appendWhereClause(where, clause)
+}
+
+func appendBatchKeysetSQL(where string, args *[]interface{}, cursor *keysetCursor) string {
+	if cursor == nil {
+		return where
+	}
+	*args = append(*args, cursor.UpdatedAt, cursor.ID)
+	clause := fmt.Sprintf("(updated_at, id) < ($%d, $%d)", len(*args)-1, len(*args))
+	return appendWhereClause(where, clause)
+}
+
+func appendWhereClause(where, clause string) string {
+	if where == "" {
+		return "where " + clause
+	}
+	return where + " and " + clause
+}
+
+func (s *PostgresStore) count(ctx context.Context, query string, args ...interface{}) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func scanCountRows(ctx context.Context, db *sql.DB, query string, target map[string]int) error {

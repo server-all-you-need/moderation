@@ -24,7 +24,7 @@ const (
 	ScopeSubmit = "moderation:submit"
 	ScopeRead   = "moderation:read"
 
-	MaxJSONBodyBytes = 262144
+	MaxJSONBodyBytes = 1048576
 )
 
 type Config struct {
@@ -48,6 +48,7 @@ type Store interface {
 	ListBatches(context.Context, moderation.ListFilter) (moderation.BatchPage, error)
 	GetAdminTask(context.Context, string) (moderation.Task, bool, error)
 	GetAdminBatch(context.Context, string) (moderation.Batch, bool, error)
+	ListAdminBatchItems(context.Context, string, moderation.BatchItemCursor) (moderation.BatchItemsPage, error)
 	ListAPIClients(context.Context) ([]moderation.APIClient, error)
 	AdminStats(context.Context) (moderation.AdminStatsSnapshot, error)
 	UpsertAPIClient(context.Context, moderation.APIClient) error
@@ -159,6 +160,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("GET /internal/v1/moderation/tasks/{id}", s.handleAdminTask)
 	mux.HandleFunc("GET /internal/v1/moderation/batches", s.handleAdminBatches)
 	mux.HandleFunc("GET /internal/v1/moderation/batches/{id}", s.handleAdminBatch)
+	mux.HandleFunc("GET /internal/v1/moderation/batches/{id}/items", s.handleAdminBatchItems)
 	s.mux = mux
 }
 
@@ -185,7 +187,7 @@ func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req moderationRequest
+	var req syncModerationRequest
 	if !decodeRequest(w, r, &req) {
 		return
 	}
@@ -217,7 +219,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req moderationRequest
+	var req asyncModerationRequest
 	if !decodeRequest(w, r, &req) {
 		return
 	}
@@ -341,7 +343,12 @@ func (s *Server) handleBatchItems(w http.ResponseWriter, r *http.Request) {
 	if !s.acquireCaller(w, r, client.ID) {
 		return
 	}
-	page, err := s.store.ListBatchItems(r.Context(), client.ID, r.PathValue("id"), moderation.BatchItemCursor{Limit: queryLimit(r), Cursor: r.URL.Query().Get("cursor")})
+	limit, err := queryLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		return
+	}
+	page, err := s.store.ListBatchItems(r.Context(), client.ID, r.PathValue("id"), moderation.BatchItemCursor{Limit: limit, Cursor: r.URL.Query().Get("cursor")})
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -385,7 +392,12 @@ func (s *Server) handleAdminTasks(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
-	page, err := s.store.ListTasks(r.Context(), filterFromRequest(r, false))
+	filter, err := filterFromRequest(r, false)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		return
+	}
+	page, err := s.store.ListTasks(r.Context(), filter)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -413,7 +425,12 @@ func (s *Server) handleAdminBatches(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
-	page, err := s.store.ListBatches(r.Context(), filterFromRequest(r, true))
+	filter, err := filterFromRequest(r, true)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		return
+	}
+	page, err := s.store.ListBatches(r.Context(), filter)
 	if err != nil {
 		writeStoreError(w, err)
 		return
@@ -435,6 +452,23 @@ func (s *Server) handleAdminBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, batchDTO(batch))
+}
+
+func (s *Server) handleAdminBatchItems(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	limit, err := queryLimit(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		return
+	}
+	page, err := s.store.ListAdminBatchItems(r.Context(), r.PathValue("id"), moderation.BatchItemCursor{Limit: limit, Cursor: r.URL.Query().Get("cursor")})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": tasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
 func (s *Server) requirePublic(w http.ResponseWriter, r *http.Request, scope string) (ClientConfig, bool) {
@@ -464,12 +498,8 @@ func (s *Server) authenticateClient(r *http.Request) (ClientConfig, bool) {
 	if !ok {
 		return ClientConfig{}, false
 	}
-	for _, client := range s.clients {
-		if constantTimeSHA256(token, client.TokenSHA256) {
-			return client, true
-		}
-	}
-	return ClientConfig{}, false
+	client, matched, _ := matchClientToken(token, s.clients)
+	return client, matched
 }
 
 func (s *Server) acquireCaller(w http.ResponseWriter, r *http.Request, callerID string) bool {
@@ -537,6 +567,20 @@ func constantTimeSHA256(token, expectedHex string) bool {
 	return subtle.ConstantTimeCompare([]byte(actual), []byte(expectedHex)) == 1
 }
 
+func matchClientToken(token string, clients []ClientConfig) (ClientConfig, bool, int) {
+	var matched ClientConfig
+	found := false
+	comparisons := 0
+	for _, client := range clients {
+		comparisons++
+		if constantTimeSHA256(token, client.TokenSHA256) {
+			matched = client
+			found = true
+		}
+	}
+	return matched, found, comparisons
+}
+
 func (c ClientConfig) hasScope(scope string) bool {
 	for _, candidate := range c.Scopes {
 		if candidate == scope {
@@ -554,7 +598,25 @@ func (c ClientConfig) webhookAllowed(url string) bool {
 	return ok
 }
 
-type moderationRequest struct {
+type syncModerationRequest struct {
+	ClientItemID string                    `json:"client_item_id"`
+	ContentType  auditplatform.ContentType `json:"content_type"`
+	Policy       auditplatform.Policy      `json:"policy"`
+	Text         string                    `json:"text,omitempty"`
+	ImageURL     string                    `json:"image_url,omitempty"`
+}
+
+func (r syncModerationRequest) toInput() auditplatform.ModerationInput {
+	return auditplatform.ModerationInput{
+		ClientItemID: r.ClientItemID,
+		ContentType:  r.ContentType,
+		Policy:       r.Policy,
+		Text:         r.Text,
+		ImageURL:     r.ImageURL,
+	}
+}
+
+type asyncModerationRequest struct {
 	ClientItemID string                    `json:"client_item_id"`
 	ContentType  auditplatform.ContentType `json:"content_type"`
 	Policy       auditplatform.Policy      `json:"policy"`
@@ -563,7 +625,7 @@ type moderationRequest struct {
 	WebhookURL   string                    `json:"webhook_url,omitempty"`
 }
 
-func (r moderationRequest) toInput() auditplatform.ModerationInput {
+func (r asyncModerationRequest) toInput() auditplatform.ModerationInput {
 	return auditplatform.ModerationInput{
 		ClientItemID: r.ClientItemID,
 		ContentType:  r.ContentType,
@@ -574,8 +636,8 @@ func (r moderationRequest) toInput() auditplatform.ModerationInput {
 }
 
 type batchRequest struct {
-	Items      []moderationRequest `json:"items"`
-	WebhookURL string              `json:"webhook_url,omitempty"`
+	Items      []syncModerationRequest `json:"items"`
+	WebhookURL string                  `json:"webhook_url,omitempty"`
 }
 
 type taskResponse struct {
@@ -717,6 +779,8 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, moderation.ErrWebhookNotAllowed):
 		writeError(w, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
+	case errors.Is(err, moderation.ErrInvalidCursor), errors.Is(err, moderation.ErrInvalidLimit):
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "dependency_unavailable", "dependency unavailable")
 	}
@@ -728,19 +792,30 @@ func canonicalHash(value interface{}) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func queryLimit(r *http.Request) int {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	return limit
+func queryLimit(r *http.Request) (int, error) {
+	raw := r.URL.Query().Get("limit")
+	if raw == "" {
+		return 0, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 || limit > 100 {
+		return 0, moderation.ErrInvalidLimit
+	}
+	return limit, nil
 }
 
-func filterFromRequest(r *http.Request, batch bool) moderation.ListFilter {
+func filterFromRequest(r *http.Request, batch bool) (moderation.ListFilter, error) {
 	q := r.URL.Query()
+	limit, err := queryLimit(r)
+	if err != nil {
+		return moderation.ListFilter{}, err
+	}
 	filter := moderation.ListFilter{
 		CallerID:    q.Get("caller_id"),
 		ContentType: auditplatform.ContentType(q.Get("content_type")),
 		RiskLevel:   auditplatform.RiskLevel(q.Get("risk")),
 		Policy:      auditplatform.Policy(q.Get("policy")),
-		Limit:       queryLimit(r),
+		Limit:       limit,
 		Cursor:      q.Get("cursor"),
 	}
 	if batch {
@@ -748,12 +823,14 @@ func filterFromRequest(r *http.Request, batch bool) moderation.ListFilter {
 	} else {
 		filter.TaskStatus = moderation.TaskStatus(q.Get("status"))
 	}
-	return filter
+	return filter, nil
 }
 
 func AssertOpenAPIParity(handler http.Handler, document []byte) error {
 	var spec struct {
-		Paths map[string]map[string]interface{} `json:"paths"`
+		Paths map[string]map[string]struct {
+			Responses map[string]interface{} `json:"responses"`
+		} `json:"paths"`
 	}
 	if err := json.Unmarshal(document, &spec); err != nil {
 		return err
@@ -771,8 +848,14 @@ func AssertOpenAPIParity(handler http.Handler, document []byte) error {
 		if !ok {
 			return fmt.Errorf("openapi missing path %s", op.Path)
 		}
-		if _, ok := methods[strings.ToLower(op.Method)]; !ok {
+		operation, ok := methods[strings.ToLower(op.Method)]
+		if !ok {
 			return fmt.Errorf("openapi missing operation %s %s", op.Method, op.Path)
+		}
+		for _, status := range expectedOpenAPIStatuses(op.Method, op.Path) {
+			if _, ok := operation.Responses[status]; !ok {
+				return fmt.Errorf("openapi missing response %s for %s %s", status, op.Method, op.Path)
+			}
 		}
 	}
 	for path, methods := range spec.Paths {
@@ -797,6 +880,19 @@ func AssertOpenAPIParity(handler http.Handler, document []byte) error {
 		return fmt.Errorf("openapi must declare auth and idempotency headers")
 	}
 	return nil
+}
+
+func expectedOpenAPIStatuses(method, path string) []string {
+	switch method + " " + path {
+	case http.MethodPost + " /api/v1/moderations:check":
+		return []string{"200", "400", "401", "403", "429", "502", "503"}
+	case http.MethodPost + " /api/v1/moderation-tasks", http.MethodPost + " /api/v1/moderation-batches":
+		return []string{"202", "400", "401", "403", "409", "429", "503"}
+	case http.MethodGet + " /api/v1/moderation-tasks/{id}", http.MethodGet + " /api/v1/moderation-batches/{id}", http.MethodGet + " /api/v1/moderation-batches/{id}/items":
+		return []string{"200", "400", "401", "403", "404", "429", "503"}
+	default:
+		return nil
+	}
 }
 
 func operationListed(ops []operation, method, path string) bool {

@@ -71,9 +71,6 @@ func (cfg AppConfig) ValidateV2() error {
 	if len(cfg.Kafka.Brokers) == 0 || cfg.Kafka.Version == "" || cfg.Kafka.ConsumerGroupID == "" {
 		return validationError("kafka brokers, version, and consumer_group_id are required")
 	}
-	if cfg.Kafka.Topics.ModerationTasks == "" || cfg.Kafka.Topics.ModerationDLQ == "" {
-		return validationError("kafka moderation topics are required")
-	}
 	if !cfg.Kafka.Producer.ReturnSuccesses || !cfg.Kafka.Producer.ReturnErrors {
 		return validationError("kafka sync producer must return successes and errors")
 	}

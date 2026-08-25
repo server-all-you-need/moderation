@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Xushengqwer/post_audit/internal/auditplatform"
@@ -19,14 +20,8 @@ const (
 var RetryDelays = []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 
 type TaskEvent struct {
-	Version       int                       `json:"version"`
-	TaskID        string                    `json:"task_id"`
-	CallerID      string                    `json:"caller_id"`
-	BatchID       string                    `json:"batch_id,omitempty"`
-	ClientItemID  string                    `json:"client_item_id"`
-	ContentType   auditplatform.ContentType `json:"content_type"`
-	Policy        auditplatform.Policy      `json:"policy"`
-	CorrelationID string                    `json:"correlation_id"`
+	Version int    `json:"version"`
+	TaskID  string `json:"task_id"`
 }
 
 type DLQEvent struct {
@@ -48,14 +43,8 @@ type DLQSender interface {
 
 func TaskEventFromTask(task Task) TaskEvent {
 	return TaskEvent{
-		Version:       1,
-		TaskID:        task.ID,
-		CallerID:      task.CallerID,
-		BatchID:       task.BatchID,
-		ClientItemID:  task.ClientItemID,
-		ContentType:   task.ContentType,
-		Policy:        task.Policy,
-		CorrelationID: task.CorrelationID,
+		Version: 1,
+		TaskID:  task.ID,
 	}
 }
 
@@ -71,14 +60,8 @@ func PublishTaskOutbox(ctx context.Context, store TaskOutboxStore, publisher Pub
 	var firstErr error
 	for _, row := range rows {
 		value, err := MarshalTaskEvent(TaskEvent{
-			Version:       1,
-			TaskID:        row.TaskID,
-			CallerID:      row.CallerID,
-			BatchID:       row.BatchID,
-			ClientItemID:  row.ClientItemID,
-			ContentType:   row.ContentType,
-			Policy:        row.Policy,
-			CorrelationID: row.CorrelationID,
+			Version: 1,
+			TaskID:  row.TaskID,
 		})
 		if err == nil {
 			err = publisher.Publish(ctx, TopicModerationTasksV1, row.TaskID, value)
@@ -104,7 +87,7 @@ type Worker struct {
 
 func NewWorker(store *MemoryStore, provider auditplatform.Provider, dlq DLQSender) *Worker {
 	_ = dlq
-	return NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ClaimFor: 30 * time.Second})
+	return NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ProviderBudget: allowAllProviderBudget{}, ClaimFor: 30 * time.Second})
 }
 
 type WorkerOptions struct {
@@ -116,15 +99,20 @@ type WorkerOptions struct {
 }
 
 func NewWorkerWithOptions(options WorkerOptions) *Worker {
+	if options.Store == nil {
+		panic("worker store is required")
+	}
+	if options.Provider == nil {
+		panic("worker provider is required")
+	}
+	if options.ProviderBudget == nil {
+		panic("worker provider budget is required")
+	}
 	claimFor := options.ClaimFor
 	if claimFor <= 0 {
 		claimFor = 30 * time.Second
 	}
-	budget := options.ProviderBudget
-	if budget == nil {
-		budget = allowAllProviderBudget{}
-	}
-	return &Worker{store: options.Store, provider: options.Provider, providerBudget: budget, claimFor: claimFor}
+	return &Worker{store: options.Store, provider: options.Provider, providerBudget: options.ProviderBudget, claimFor: claimFor}
 }
 
 func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
@@ -136,10 +124,10 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 	outcome, budgetErr := w.providerBudget.AcquireAsyncProvider(ctx)
 	if budgetErr != nil || !outcome.Allowed {
 		code := "rate_limited"
-		message := string(outcome.Reason)
+		message := publicTaskErrorMessage(code)
 		if budgetErr != nil {
 			code = "rate_limiter_unavailable"
-			message = budgetErr.Error()
+			message = publicTaskErrorMessage(code)
 		}
 		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), messageWithCode(code, message))
 	}
@@ -150,7 +138,7 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 	}
 	input, err := inputFromTask(task)
 	if err != nil {
-		return w.failAndDLQ(ctx, task, TaskError{Code: auditplatform.ErrorCodeInvalidInput, Message: err.Error()}, "missing_input")
+		return w.failAndDLQ(ctx, task, TaskError{Code: auditplatform.ErrorCodeInvalidInput, Message: publicTaskErrorMessage(auditplatform.ErrorCodeInvalidInput)}, "missing_input")
 	}
 	result, err := w.provider.Moderate(ctx, input)
 	if err == nil {
@@ -159,11 +147,12 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 
 	var providerErr *auditplatform.ProviderError
 	if errors.As(err, &providerErr) && providerErr.Retryable && task.Attempts < 5 {
-		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), providerErr.Error())
+		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), messageWithCode(providerErr.Code, publicTaskErrorMessage(providerErr.Code)))
 	}
-	taskErr := TaskError{Code: auditplatform.ErrorCodeProviderResponse, Message: err.Error()}
+	taskErr := TaskError{Code: auditplatform.ErrorCodeProviderResponse, Message: publicTaskErrorMessage(auditplatform.ErrorCodeProviderResponse)}
 	if providerErr != nil {
 		taskErr.Code = providerErr.Code
+		taskErr.Message = publicTaskErrorMessage(providerErr.Code)
 	}
 	return w.failAndDLQ(ctx, task, taskErr, "provider_failure")
 }
@@ -188,6 +177,32 @@ func messageWithCode(code, message string) string {
 		return code
 	}
 	return code + ": " + message
+}
+
+func publicTaskErrorMessage(code string) string {
+	switch code {
+	case "rate_limited":
+		return "provider rate limit exceeded"
+	case "rate_limiter_unavailable":
+		return "rate limiter unavailable"
+	case auditplatform.ErrorCodeInvalidInput, auditplatform.ErrorCodeInvalidRequest:
+		return "invalid moderation input"
+	case auditplatform.ErrorCodeProviderTemporary:
+		return "provider temporarily unavailable"
+	default:
+		return "provider moderation failed"
+	}
+}
+
+func retryTaskError(message string) *TaskError {
+	code := auditplatform.ErrorCodeProviderTemporary
+	if prefix, _, ok := strings.Cut(message, ":"); ok {
+		switch prefix {
+		case "rate_limited", "rate_limiter_unavailable", auditplatform.ErrorCodeProviderTemporary, auditplatform.ErrorCodeProviderResponse:
+			code = prefix
+		}
+	}
+	return &TaskError{Code: code, Message: publicTaskErrorMessage(code)}
 }
 
 func RequeueDueRetries(ctx context.Context, store RetryStore, limit int) (int, error) {

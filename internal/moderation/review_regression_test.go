@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -89,6 +90,49 @@ func TestWorkerRedisFailureDoesNotCallProviderOrSilentlyBypassLimit(t *testing.T
 	if updated.Status != TaskStatusQueued || updated.Error == nil || updated.Error.Code != "rate_limiter_unavailable" {
 		t.Fatalf("redis failure should be recorded as retryable limiter state: %#v", updated)
 	}
+	if strings.Contains(updated.Error.Message, "redis down") {
+		t.Fatalf("public task error leaked dependency detail: %#v", updated.Error)
+	}
+}
+
+func TestWorkerRequiresExplicitProviderBudget(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("NewWorkerWithOptions must fail fast when ProviderBudget is nil")
+		}
+	}()
+	_ = NewWorkerWithOptions(WorkerOptions{Store: NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)), Provider: &fakeProvider{}})
+}
+
+func TestWorkerStoresStablePublicProviderFailure(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
+	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "idem-1",
+		PayloadHash:    "sha256:payload",
+		Input:          textInput("post-1", "sensitive"),
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	worker := NewWorkerWithOptions(WorkerOptions{
+		Store:          store,
+		Provider:       &fakeProvider{errors: []error{&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: false, Message: "upstream request id secret-detail"}}},
+		ProviderBudget: allowAllProviderBudget{},
+		ClaimFor:       30 * time.Second,
+	})
+	if err := worker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
+		t.Fatalf("process task: %v", err)
+	}
+	updated, _ := store.Task(task.ID)
+	if updated.Error == nil || updated.Error.Code != auditplatform.ErrorCodeProviderTemporary {
+		t.Fatalf("unexpected public error: %#v", updated.Error)
+	}
+	if strings.Contains(updated.Error.Message, "upstream") || strings.Contains(updated.Error.Message, "secret-detail") {
+		t.Fatalf("public task error leaked provider detail: %#v", updated.Error)
+	}
 }
 
 func TestRetryScannerRequeuesDueTasksThroughTaskOutbox(t *testing.T) {
@@ -105,10 +149,11 @@ func TestRetryScannerRequeuesDueTasksThroughTaskOutbox(t *testing.T) {
 		t.Fatalf("create task: %v", err)
 	}
 	worker := NewWorkerWithOptions(WorkerOptions{
-		Store:    store,
-		Provider: &fakeProvider{errors: []error{&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary"}}},
-		DLQ:      store,
-		ClaimFor: 30 * time.Second,
+		Store:          store,
+		Provider:       &fakeProvider{errors: []error{&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary"}}},
+		ProviderBudget: allowAllProviderBudget{},
+		DLQ:            store,
+		ClaimFor:       30 * time.Second,
 	})
 	if err := worker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
 		t.Fatalf("process retryable: %v", err)
@@ -138,10 +183,11 @@ func TestTerminalFailureCreatesDurableDLQOutboxEvenWhenPublisherFails(t *testing
 		t.Fatalf("create task: %v", err)
 	}
 	worker := NewWorkerWithOptions(WorkerOptions{
-		Store:    store,
-		Provider: &fakeProvider{errors: []error{&auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Retryable: false, Message: "bad"}}},
-		DLQ:      store,
-		ClaimFor: 30 * time.Second,
+		Store:          store,
+		Provider:       &fakeProvider{errors: []error{&auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Retryable: false, Message: "bad"}}},
+		ProviderBudget: allowAllProviderBudget{},
+		DLQ:            store,
+		ClaimFor:       30 * time.Second,
 	})
 	if err := worker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
 		t.Fatalf("terminal failure: %v", err)
@@ -465,7 +511,7 @@ func TestMemoryLimitDenialDoesNotConsumeProviderAttempts(t *testing.T) {
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 3"},
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 4"},
 	}, results: []auditplatform.ModerationResult{{ClientItemID: "post-1", Decision: auditplatform.DecisionPass, RiskLevel: auditplatform.RiskLevelLow, ProviderName: "fake"}}}
-	allowedWorker := NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ClaimFor: 30 * time.Second})
+	allowedWorker := NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ProviderBudget: allowAllProviderBudget{}, ClaimFor: 30 * time.Second})
 	for i := 0; i < 5; i++ {
 		if err := allowedWorker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
 			t.Fatalf("provider attempt %d: %v", i+1, err)
