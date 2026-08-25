@@ -127,6 +127,9 @@ func ValidatePublicHTTPSImageURL(raw string) error {
 	if host == "" {
 		return fmt.Errorf("image_url must have a hostname")
 	}
+	if strings.Contains(parsed.Host, ":") && parsed.Port() == "" {
+		return fmt.Errorf("image_url has invalid explicit port")
+	}
 	if port := parsed.Port(); port != "" && port != "443" {
 		return fmt.Errorf("image_url must not use non-443 explicit port")
 	}
@@ -137,10 +140,28 @@ func ValidatePublicHTTPSImageURL(raw string) error {
 	if normalizedHost == "localhost" || strings.HasSuffix(normalizedHost, ".local") || strings.HasSuffix(normalizedHost, ".internal") {
 		return fmt.Errorf("image_url hostname must be public")
 	}
-	if strings.Contains(normalizedHost, "_") {
+	if !isDNSHostname(normalizedHost) {
 		return fmt.Errorf("image_url must have a DNS hostname")
 	}
 	return nil
+}
+
+func isDNSHostname(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func validateClientItemID(id string) error {

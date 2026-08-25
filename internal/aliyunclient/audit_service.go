@@ -263,6 +263,9 @@ func providerStatusError(httpStatus, bodyCode int32) error {
 	if httpStatus == 200 && bodyCode == 200 {
 		return nil
 	}
+	if httpStatus == 429 || bodyCode == 429 {
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeThrottled, Retryable: true, Message: "aliyun throttled"}
+	}
 	status := bodyCode
 	if status == 0 {
 		status = httpStatus

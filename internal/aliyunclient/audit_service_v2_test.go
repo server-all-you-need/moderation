@@ -156,6 +156,22 @@ func TestModerateClassifiesProviderErrorsRetryability(t *testing.T) {
 			retryable: true,
 		},
 		{
+			name: "http 429 is retryable throttling",
+			setup: func(fake *fakeGreenSDK) {
+				fake.textResponse = textResponse(429, 200, "req-http-429", "none")
+			},
+			code:      auditplatform.ErrorCodeThrottled,
+			retryable: true,
+		},
+		{
+			name: "provider body 429 is retryable throttling",
+			setup: func(fake *fakeGreenSDK) {
+				fake.textResponse = textResponse(200, 429, "req-body-429", "none")
+			},
+			code:      auditplatform.ErrorCodeThrottled,
+			retryable: true,
+		},
+		{
 			name: "provider 5xx body code is retryable",
 			setup: func(fake *fakeGreenSDK) {
 				fake.textResponse = textResponse(200, 503, "req-503", "none")

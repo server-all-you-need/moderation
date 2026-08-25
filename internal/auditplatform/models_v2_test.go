@@ -155,12 +155,17 @@ func TestImageURLValidationRequiresPublicHTTPSDNSHost(t *testing.T) {
 		"http://cdn.example.com/a.png",
 		"https://user:pass@cdn.example.com/a.png",
 		"https://cdn.example.com:8443/a.png",
+		"https://cdn.example.com:abc/a.png",
 		"https://127.0.0.1/a.png",
 		"https://[::1]/a.png",
 		"https://localhost/a.png",
 		"https://image.local/a.png",
 		"https://image.internal/a.png",
 		"https:///a.png",
+		"https://cdn..example.com/a.png",
+		"https://-cdn.example.com/a.png",
+		"https://cdn-.example.com/a.png",
+		"https://bad!host.example.com/a.png",
 	}
 	for _, imageURL := range invalid {
 		input := validImageInput()
