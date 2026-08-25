@@ -3,6 +3,13 @@ package config
 import "testing"
 
 func TestV2RuntimeConfigDecodesModerationServiceWithoutLegacyTopics(t *testing.T) {
+	if err := ValidateV2RuntimeConfigYAML([]byte(`
+aliyun_audit:
+  text_moderation_service: "comment_detection"
+`)); err == nil {
+		t.Fatalf("legacy aliyun_audit.text_moderation_service must be rejected because provider policy mapping is fixed")
+	}
+
 	cfg := loadAppConfigFromYAML(t, `
 server:
   addr: ":8080"
@@ -52,6 +59,9 @@ webhook_secrets:
 	if len(cfg.APIClients) != 1 || cfg.APIClients[0].WebhookEndpoints[0].SecretID != "secret-1" {
 		t.Fatalf("api client/webhook decode failed: %#v", cfg.APIClients)
 	}
+	if err := cfg.ValidateV2(); err != nil {
+		t.Fatalf("V2 config without legacy text_moderation_service rejected: %v", err)
+	}
 }
 
 func TestV2RuntimeConfigValidationRejectsMissingProductionDependencies(t *testing.T) {
@@ -74,5 +84,50 @@ func TestV2RuntimeConfigValidationRejectsMissingProductionDependencies(t *testin
 
 	if err := cfg.ValidateV2(); err != nil {
 		t.Fatalf("valid V2 config rejected: %v", err)
+	}
+}
+
+func TestV2RuntimeConfigValidationRejectsIncompleteWebhookRegistration(t *testing.T) {
+	cfg := AppConfig{
+		Server:   ServerConfig{Addr: ":8080"},
+		Database: DatabaseConfig{URL: "postgres://moderation:placeholder@postgres/moderation?sslmode=disable"},
+		Redis:    RedisConfig{Addr: "redis:6379"},
+		Kafka: KafkaConfig{
+			Brokers:         []string{"kafka:9092"},
+			Version:         "2.8.1",
+			ConsumerGroupID: "moderation-worker",
+			Producer:        ProducerConfig{ReturnSuccesses: true, ReturnErrors: true},
+		},
+		AliyunAudit: AliyunConfig{AccessKeyID: "placeholder", AccessKeySecret: "placeholder"},
+		APIClients: []APIClientConfig{{
+			ID:          "client-a",
+			Name:        "Client A",
+			TokenSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			Scopes:      []string{"moderation:submit"},
+			WebhookEndpoints: []WebhookEndpointConfig{{
+				URL:      "https://hooks.example.com/moderation",
+				SecretID: "secret-1",
+			}},
+		}},
+		Admin: AdminConfig{TokenSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+	}
+
+	if err := cfg.ValidateV2(); err == nil {
+		t.Fatalf("webhook endpoint without same-caller secret must be rejected")
+	}
+
+	cfg.WebhookSecrets = []WebhookSecret{{CallerID: "other-client", SecretID: "secret-1", Value: "runtime-webhook-secret-value"}}
+	if err := cfg.ValidateV2(); err == nil {
+		t.Fatalf("webhook secret for a different caller must be rejected")
+	}
+
+	cfg.WebhookSecrets = []WebhookSecret{{CallerID: "client-a", SecretID: "secret-1", Value: "runtime-webhook-secret-value"}}
+	if err := cfg.ValidateV2(); err != nil {
+		t.Fatalf("matching webhook endpoint and secret rejected: %v", err)
+	}
+
+	cfg.APIClients[0].WebhookEndpoints[0].URL = "http://hooks.example.com/moderation"
+	if err := cfg.ValidateV2(); err == nil {
+		t.Fatalf("webhook endpoint must require HTTPS")
 	}
 }

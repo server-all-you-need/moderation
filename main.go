@@ -34,6 +34,14 @@ func main() {
 	flag.StringVar(&configFile, "config", "internal/config/config.development.yaml", "config file path")
 	flag.Parse()
 
+	runtimeConfigFile := os.Getenv("APP_CONFIG_PATH")
+	if runtimeConfigFile == "" {
+		runtimeConfigFile = configFile
+	}
+	if err := config.ValidateV2RuntimeConfigFile(runtimeConfigFile); err != nil {
+		log.Fatalf("invalid runtime config source %s: %v", runtimeConfigFile, err)
+	}
+
 	var cfg config.AppConfig
 	if err := core.LoadConfig(configFile, &cfg); err != nil {
 		log.Fatalf("load config %s: %v", configFile, err)

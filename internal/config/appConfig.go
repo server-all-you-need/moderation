@@ -1,20 +1,24 @@
 package config
 
-import "github.com/Xushengqwer/go-common/config"
+import (
+	"net/url"
+
+	commonconfig "github.com/Xushengqwer/go-common/config"
+)
 
 // AppConfig 是整个应用的配置结构体
 type AppConfig struct {
-	ZapConfig      config.ZapConfig    `mapstructure:"zapConfig" json:"zapConfig" config.development.yaml:"zapConfig"`
-	TracerConfig   config.TracerConfig `mapstructure:"tracerConfig" json:"tracerConfig" yaml:"tracerConfig"`
-	Server         ServerConfig        `mapstructure:"server"`
-	Database       DatabaseConfig      `mapstructure:"database"`
-	Redis          RedisConfig         `mapstructure:"redis"`
-	Kafka          KafkaConfig         `mapstructure:"kafka"`
-	AliyunAudit    AliyunConfig        `mapstructure:"aliyun_audit"`
-	APIClients     []APIClientConfig   `mapstructure:"api_clients"`
-	Admin          AdminConfig         `mapstructure:"admin"`
-	WebhookSecrets []WebhookSecret     `mapstructure:"webhook_secrets"`
-	Log            config.ZapConfig    `mapstructure:"log"`
+	ZapConfig      commonconfig.ZapConfig    `mapstructure:"zapConfig" json:"zapConfig" config.development.yaml:"zapConfig"`
+	TracerConfig   commonconfig.TracerConfig `mapstructure:"tracerConfig" json:"tracerConfig" yaml:"tracerConfig"`
+	Server         ServerConfig              `mapstructure:"server"`
+	Database       DatabaseConfig            `mapstructure:"database"`
+	Redis          RedisConfig               `mapstructure:"redis"`
+	Kafka          KafkaConfig               `mapstructure:"kafka"`
+	AliyunAudit    AliyunConfig              `mapstructure:"aliyun_audit"`
+	APIClients     []APIClientConfig         `mapstructure:"api_clients"`
+	Admin          AdminConfig               `mapstructure:"admin"`
+	WebhookSecrets []WebhookSecret           `mapstructure:"webhook_secrets"`
+	Log            commonconfig.ZapConfig    `mapstructure:"log"`
 }
 
 type ServerConfig struct {
@@ -80,9 +84,37 @@ func (cfg AppConfig) ValidateV2() error {
 	if len(cfg.APIClients) == 0 {
 		return validationError("at least one api client is required")
 	}
+	webhookSecrets := map[string]struct{}{}
+	for _, secret := range cfg.WebhookSecrets {
+		if secret.CallerID == "" || secret.SecretID == "" || secret.Value == "" {
+			return validationError("webhook secret caller_id, secret_id, and value are required")
+		}
+		webhookSecrets[secret.CallerID+"\x00"+secret.SecretID] = struct{}{}
+	}
+	referencedSecrets := map[string]struct{}{}
 	for _, client := range cfg.APIClients {
 		if client.ID == "" || client.Name == "" || client.TokenSHA256 == "" || len(client.Scopes) == 0 {
 			return validationError("api client id, name, token digest, and scopes are required")
+		}
+		for _, endpoint := range client.WebhookEndpoints {
+			if endpoint.URL == "" || endpoint.SecretID == "" {
+				return validationError("webhook endpoint url and secret_id are required")
+			}
+			parsed, err := url.Parse(endpoint.URL)
+			if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+				return validationError("webhook endpoint url must be HTTPS")
+			}
+			key := client.ID + "\x00" + endpoint.SecretID
+			if _, ok := webhookSecrets[key]; !ok {
+				return validationError("webhook endpoint secret_id must match a same-caller webhook secret")
+			}
+			referencedSecrets[key] = struct{}{}
+		}
+	}
+	for _, secret := range cfg.WebhookSecrets {
+		key := secret.CallerID + "\x00" + secret.SecretID
+		if _, ok := referencedSecrets[key]; !ok {
+			return validationError("webhook secret must be referenced by a same-caller endpoint")
 		}
 	}
 	if cfg.Admin.TokenSHA256 == "" {
