@@ -5,116 +5,277 @@ import (
 	"database/sql"
 	"flag"
 	"log"
-	"os"
+	"net/http"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/IBM/sarama"
 	"github.com/Xushengqwer/go-common/core"
 	"github.com/Xushengqwer/post_audit/internal/aliyunclient"
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 	"github.com/Xushengqwer/post_audit/internal/config"
-	"github.com/Xushengqwer/post_audit/internal/constants"
-	"github.com/Xushengqwer/post_audit/internal/kafka"
+	"github.com/Xushengqwer/post_audit/internal/httpapi"
+	"github.com/Xushengqwer/post_audit/internal/moderation"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
 func main() {
 	var configFile string
-	flag.StringVar(&configFile, "config", "internal/config/config.development.yaml", "指定配置文件的路径")
+	flag.StringVar(&configFile, "config", "internal/config/config.development.yaml", "config file path")
 	flag.Parse()
 
 	var cfg config.AppConfig
 	if err := core.LoadConfig(configFile, &cfg); err != nil {
-		log.Fatalf("致命错误: 加载配置文件 '%s' 失败: %v", configFile, err)
+		log.Fatalf("load config %s: %v", configFile, err)
+	}
+	if err := cfg.ValidateV2(); err != nil {
+		log.Fatalf("invalid runtime config: %v", err)
 	}
 
-	logger, loggerErr := core.NewZapLogger(cfg.ZapConfig)
-	if loggerErr != nil {
-		log.Fatalf("致命错误: 初始化 ZapLogger 失败: %v", loggerErr)
+	logger, err := core.NewZapLogger(cfg.ZapConfig)
+	if err != nil {
+		log.Fatalf("initialize logger: %v", err)
 	}
 	defer func() {
-		logger.Info("正在同步所有日志条目...")
 		if err := logger.Logger().Sync(); err != nil {
-			log.Printf("警告: ZapLogger Sync 操作失败: %v\n", err)
+			log.Printf("logger sync failed: %v", err)
 		}
 	}()
-	logger.Info("Logger 初始化成功。")
 
-	var moderator auditplatform.ContentReviewer
-	logger.Info("根据配置初始化审核平台...", zap.String("configured_platform", cfg.AuditPlatform))
-
-	switch cfg.AuditPlatform {
-	case "aliyun":
-		aliClient, clientErr := aliyunclient.NewAliyunAuditClient(cfg.AliyunAudit, logger)
-		if clientErr != nil {
-			logger.Fatal("初始化阿里云审核客户端失败", zap.Error(clientErr))
-		}
-		moderator = aliClient
-		logger.Info("审核平台初始化成功: 阿里云")
-	default:
-		logger.Fatal("未知的或未配置的审核平台",
-			zap.String("configured_platform", cfg.AuditPlatform),
-			zap.String("supported_platforms", "aliyun"),
-		)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, cfg, logger); err != nil {
+		logger.Fatal("moderation service stopped", zap.Error(err))
 	}
+}
 
-	saramaCfg, err := kafka.GetSaramaConfig(cfg.Kafka, constants.ServiceName, logger)
+func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) error {
+	db, err := sql.Open("postgres", cfg.Database.URL)
 	if err != nil {
-		logger.Fatal("创建 Kafka Sarama 配置失败", zap.Error(err))
+		return err
 	}
-	logger.Info("Kafka Sarama 配置创建成功。")
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return err
+	}
+	store := moderation.NewPostgresStore(db, time.Now)
+	if err := store.ApplyMigrations(ctx); err != nil {
+		return err
+	}
 
-	kafkaProd, err := kafka.NewKafkaProducer(cfg.Kafka.Brokers, saramaCfg, cfg.Kafka.Topics, logger)
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
+	defer redisClient.Close()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		return err
+	}
+	limiter := moderation.NewRedisLimiter(redisClient, moderation.RedisLimiterConfig{
+		CallerPerSecond:   20,
+		ProviderPerSecond: 80,
+		AsyncPerSecond:    60,
+		Window:            time.Second,
+	})
+
+	aliClient, err := aliyunclient.NewAliyunModerationClient(aliyunclient.AliyunClientConfig{
+		AccessKeyID:     cfg.AliyunAudit.AccessKeyID,
+		AccessKeySecret: cfg.AliyunAudit.AccessKeySecret,
+		Region:          cfg.AliyunAudit.RegionOrDefault(),
+		Endpoint:        cfg.AliyunAudit.EndpointOrDefault(),
+		ConnectTimeout:  time.Duration(cfg.AliyunAudit.TimeoutMs) * time.Millisecond,
+		ReadTimeout:     time.Duration(cfg.AliyunAudit.TimeoutMs) * time.Millisecond,
+	}, logger)
 	if err != nil {
-		logger.Fatal("初始化 Kafka 生产者失败", zap.Error(err))
+		return err
 	}
-	defer func() {
-		logger.Info("正在关闭 Kafka 生产者...")
-		if err := kafkaProd.Close(); err != nil {
-			logger.Error("关闭 Kafka 生产者失败", zap.Error(err))
-		} else {
-			logger.Info("Kafka 生产者已成功关闭。")
-		}
-	}()
-	logger.Info("Kafka 生产者初始化成功。")
 
-	auditService := kafka.NewAuditProcessorService(logger, moderator, kafkaProd)
-	logger.Info("业务逻辑处理器 (AuditProcessorService) 初始化成功。")
+	saramaCfg, err := newSaramaConfig(cfg.Kafka)
+	if err != nil {
+		return err
+	}
+	clusterAdmin, err := sarama.NewClusterAdmin(cfg.Kafka.Brokers, saramaCfg)
+	if err != nil {
+		return err
+	}
+	defer clusterAdmin.Close()
+	kafkaClient, err := sarama.NewClient(cfg.Kafka.Brokers, saramaCfg)
+	if err != nil {
+		return err
+	}
+	defer kafkaClient.Close()
+	if err := moderation.EnsureModerationTopics(moderation.NewSaramaTopicAdmin(clusterAdmin)); err != nil {
+		return err
+	}
+	producer, err := sarama.NewSyncProducer(cfg.Kafka.Brokers, saramaCfg)
+	if err != nil {
+		return err
+	}
+	publisher := moderation.NewSaramaPublisher(producer)
+	defer publisher.Close()
+	consumerGroup, err := sarama.NewConsumerGroup(cfg.Kafka.Brokers, cfg.Kafka.ConsumerGroupID, saramaCfg)
+	if err != nil {
+		return err
+	}
 
-	auditRecorder := kafka.AuditRecorder(kafka.NopAuditRecorder{})
-	var auditDB *sql.DB
-	if cfg.AdminAudit.DatabaseURL != "" {
-		var dbErr error
-		auditDB, dbErr = sql.Open("postgres", cfg.AdminAudit.DatabaseURL)
-		if dbErr != nil {
-			logger.Fatal("初始化 admin 审计数据库失败", zap.Error(dbErr))
-		}
-		if dbErr = auditDB.PingContext(context.Background()); dbErr != nil {
-			logger.Fatal("连接 admin 审计数据库失败", zap.Error(dbErr))
-		}
-		defer func() {
-			if err := auditDB.Close(); err != nil {
-				logger.Error("关闭 admin 审计数据库失败", zap.Error(err))
+	worker := moderation.NewWorkerWithOptions(moderation.WorkerOptions{
+		Store:          store,
+		Provider:       aliClient,
+		ProviderBudget: limiter,
+		ClaimFor:       30 * time.Second,
+	})
+	webhookDispatcher := moderation.NewWebhookDispatcherWithSecretResolver(store, newRuntimeSecrets(cfg.APIClients, cfg.WebhookSecrets), moderation.NetWebhookClient{Client: http.DefaultClient})
+	server, err := httpapi.NewServer(httpapi.Config{
+		Store:            store,
+		Provider:         aliClient,
+		Limiter:          limiter,
+		LagReporter:      moderation.NewSaramaLagReporter(clusterAdmin, kafkaClient, cfg.Kafka.ConsumerGroupID, moderation.TopicModerationTasksV1),
+		Clients:          httpClients(cfg.APIClients),
+		AdminTokenSHA256: cfg.Admin.TokenSHA256,
+		Ready: func(readyCtx context.Context) error {
+			if err := db.PingContext(readyCtx); err != nil {
+				return err
 			}
-		}()
-		auditRecorder = kafka.NewPostgresAuditRecorder(auditDB, cfg.AdminAudit.PlatformEnvironmentKey, logger)
-		logger.Info("admin 审计记录器已启用", zap.String("platform_environment_key", cfg.AdminAudit.PlatformEnvironmentKey))
+			if err := redisClient.Ping(readyCtx).Err(); err != nil {
+				return err
+			}
+			_, err := clusterAdmin.DescribeTopics([]string{moderation.TopicModerationTasksV1, moderation.TopicModerationTaskDLQ})
+			return err
+		},
+	})
+	if err != nil {
+		return err
 	}
-
-	logger.Info("准备启动 Kafka 消费者组...")
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := kafka.StartConsumerGroupWithRecorder(&cfg, logger, auditService, kafkaProd, auditRecorder); err != nil {
-			logger.Error("Kafka 消费者组运行出错或已停止", zap.Error(err))
+		if err := moderation.RunTaskConsumerGroup(ctx, consumerGroup, worker); err != nil {
+			logger.Error("moderation task consumer stopped", zap.Error(err))
 		}
 	}()
-	logger.Info("Kafka 消费者组已在后台goroutine启动（或即将启动）。")
+	go runEvery(ctx, 500*time.Millisecond, func(loopCtx context.Context) {
+		if err := moderation.PublishTaskOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
+			logger.Error("publish task outbox failed", zap.Error(err))
+		}
+	})
+	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+		if _, err := moderation.RequeueDueRetries(loopCtx, store, 100); err != nil {
+			logger.Error("requeue moderation retry failed", zap.Error(err))
+		}
+	})
+	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+		if err := moderation.PublishDLQOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
+			logger.Error("publish dlq outbox failed", zap.Error(err))
+		}
+	})
+	go runEvery(ctx, time.Second, func(loopCtx context.Context) {
+		if err := webhookDispatcher.DispatchDueWebhooks(loopCtx, 100); err != nil {
+			logger.Error("dispatch webhook failed", zap.Error(err))
+		}
+	})
+	go runEvery(ctx, time.Hour, func(loopCtx context.Context) {
+		_, err := store.CleanupExpiredWithError(loopCtx, 30*24*time.Hour, 500)
+		if err != nil {
+			logger.Error("cleanup expired moderation metadata failed", zap.Error(err))
+		}
+	})
 
-	receivedSignal := <-sigChan
-	logger.Info("收到关闭信号，开始优雅关闭服务...", zap.String("信号", receivedSignal.String()))
+	httpServer := &http.Server{
+		Addr:              cfg.Server.Addr,
+		Handler:           server.Handler(),
+		ReadTimeout:       timeoutMs(cfg.Server.ReadTimeoutMs, 5*time.Second),
+		ReadHeaderTimeout: timeoutMs(cfg.Server.ReadHeaderTimeoutMs, 2*time.Second),
+		WriteTimeout:      timeoutMs(cfg.Server.WriteTimeoutMs, 10*time.Second),
+		IdleTimeout:       timeoutMs(cfg.Server.IdleTimeoutMs, time.Minute),
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("moderation HTTP service listening", zap.String("addr", cfg.Server.Addr))
+		errCh <- httpServer.ListenAndServe()
+	}()
 
-	logger.Info("服务已成功关闭。")
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	}
+}
+
+func newSaramaConfig(cfg config.KafkaConfig) (*sarama.Config, error) {
+	version, err := sarama.ParseKafkaVersion(cfg.Version)
+	if err != nil {
+		return nil, err
+	}
+	saramaCfg := sarama.NewConfig()
+	saramaCfg.Version = version
+	saramaCfg.ClientID = "post-audit-pro-moderation"
+	saramaCfg.Producer.RequiredAcks = sarama.WaitForAll
+	saramaCfg.Producer.Return.Successes = true
+	saramaCfg.Producer.Return.Errors = true
+	saramaCfg.Producer.Idempotent = true
+	saramaCfg.Net.MaxOpenRequests = 1
+	saramaCfg.Consumer.Offsets.AutoCommit.Enable = cfg.Consumer.Offsets.AutoCommitEnable
+	saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+	return saramaCfg, nil
+}
+
+func runEvery(ctx context.Context, interval time.Duration, fn func(context.Context)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fn(ctx)
+		}
+	}
+}
+
+func httpClients(clients []config.APIClientConfig) []httpapi.ClientConfig {
+	out := make([]httpapi.ClientConfig, 0, len(clients))
+	for _, client := range clients {
+		webhooks := map[string]string{}
+		for _, endpoint := range client.WebhookEndpoints {
+			webhooks[endpoint.URL] = endpoint.SecretID
+		}
+		out = append(out, httpapi.ClientConfig{ID: client.ID, Name: client.Name, TokenSHA256: client.TokenSHA256, Scopes: client.Scopes, Webhooks: webhooks})
+	}
+	return out
+}
+
+type runtimeSecrets map[string]string
+
+func (s runtimeSecrets) WebhookSecret(callerID, destinationURL string) (string, bool) {
+	value, ok := s[callerID+"\x00"+destinationURL]
+	return value, ok
+}
+
+func newRuntimeSecrets(clients []config.APIClientConfig, secrets []config.WebhookSecret) runtimeSecrets {
+	byID := map[string]string{}
+	for _, secret := range secrets {
+		if secret.Value != "" {
+			byID[secret.CallerID+"\x00"+secret.SecretID] = secret.Value
+		}
+	}
+	resolver := runtimeSecrets{}
+	for _, client := range clients {
+		for _, endpoint := range client.WebhookEndpoints {
+			if value, ok := byID[client.ID+"\x00"+endpoint.SecretID]; ok {
+				resolver[client.ID+"\x00"+endpoint.URL] = value
+			}
+		}
+	}
+	return resolver
+}
+
+func timeoutMs(value int64, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
+	}
+	return time.Duration(value) * time.Millisecond
 }

@@ -96,10 +96,6 @@ func (c *AliyunAuditClient) Name() string {
 	return "aliyun"
 }
 
-func (c *AliyunAuditClient) GetPlatformName() string {
-	return c.Name()
-}
-
 func (c *AliyunAuditClient) Moderate(ctx context.Context, input auditplatform.ModerationInput) (auditplatform.ModerationResult, error) {
 	if err := input.Validate(); err != nil {
 		return auditplatform.ModerationResult{}, &auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidInput, Message: err.Error(), Err: err}
@@ -311,52 +307,4 @@ func classifyProviderError(err error) *auditplatform.ProviderError {
 	return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeNetwork, Retryable: true, Message: "aliyun network error", Err: err}
 }
 
-func (c *AliyunAuditClient) ReviewTextBatch(ctx context.Context, tasks []auditplatform.TaskData) ([]auditplatform.ReviewResult, error) {
-	if len(tasks) == 0 {
-		return []auditplatform.ReviewResult{}, nil
-	}
-	results := make([]auditplatform.ReviewResult, len(tasks))
-	for i, task := range tasks {
-		result, err := c.Moderate(ctx, auditplatform.ModerationInput{
-			ClientItemID: task.ID,
-			ContentType:  auditplatform.ContentTypeText,
-			Policy:       auditplatform.PolicyTextGeneral,
-			Text:         task.Content,
-		})
-		results[i] = toLegacyReviewResult(task.ID, result, err)
-		if err != nil {
-			var providerErr *auditplatform.ProviderError
-			if errors.As(err, &providerErr) && providerErr.Retryable {
-				return nil, err
-			}
-		}
-	}
-	return results, nil
-}
-
-func toLegacyReviewResult(taskID string, result auditplatform.ModerationResult, err error) auditplatform.ReviewResult {
-	if err != nil {
-		return auditplatform.ReviewResult{OriginalTaskID: taskID, Suggestion: string(auditplatform.DecisionReview), Error: err}
-	}
-	details := make([]auditplatform.RejectionDetail, 0, len(result.Labels))
-	for _, label := range result.Labels {
-		if result.Decision == auditplatform.DecisionPass {
-			continue
-		}
-		details = append(details, auditplatform.RejectionDetail{
-			Label:          label.Label,
-			Suggestion:     string(result.Decision),
-			Score:          label.Confidence,
-			MatchedContent: label.RiskWords,
-		})
-	}
-	return auditplatform.ReviewResult{
-		OriginalTaskID: taskID,
-		ProviderTaskID: result.ProviderDataID,
-		Suggestion:     string(result.Decision),
-		Details:        details,
-	}
-}
-
 var _ auditplatform.Provider = (*AliyunAuditClient)(nil)
-var _ auditplatform.ContentReviewer = (*AliyunAuditClient)(nil)

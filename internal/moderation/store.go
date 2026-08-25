@@ -31,6 +31,7 @@ type MemoryStore struct {
 	webhooks    map[string]WebhookEndpoint
 	webhookRows map[string]WebhookOutboxRow
 	deliveries  []WebhookDelivery
+	clients     map[string]APIClient
 }
 
 func NewMemoryStore(now time.Time) *MemoryStore {
@@ -44,6 +45,7 @@ func NewMemoryStore(now time.Time) *MemoryStore {
 		batchTasks:  map[string][]string{},
 		webhooks:    map[string]WebhookEndpoint{},
 		webhookRows: map[string]WebhookOutboxRow{},
+		clients:     map[string]APIClient{},
 	}
 }
 

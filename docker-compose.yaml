@@ -50,7 +50,7 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0 # 加快本地测试的 rebalance
       # 主题创建: KRaft 模式下由 controller 节点处理。
       # 在第一个 broker 上定义通常就足够了。
-      KAFKA_CREATE_TOPICS: "pending_moderation_topic:1:2,approved_posts_topic:1:2,rejected_posts_topic:1:2,post_audit_dlq_topic:1:2"
+      KAFKA_CREATE_TOPICS: "moderation_tasks_v1:12:2,moderation_tasks_dlq_v1:12:2"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_MESSAGE_MAX_BYTES: 1048576 # 与 config.development.yaml 中 producer.max_message_bytes 一致
 

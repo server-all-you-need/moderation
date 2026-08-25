@@ -29,10 +29,8 @@ type KafkaConfig struct {
 
 // KafkaTopics 定义了服务需要用到的 Kafka 主题名称
 type KafkaTopics struct {
-	PendingModeration string `mapstructure:"pending_moderation"` // 待审核内容主题
-	Approved          string `mapstructure:"approved"`           // 审核通过结果主题
-	Rejected          string `mapstructure:"rejected"`           // 审核不通过结果主题
-	DeadLetterQueue   string `mapstructure:"dead_letter_queue"`  // 死信队列主题
+	ModerationTasks string `mapstructure:"moderation_tasks"` // V2 task-ID-only topic
+	ModerationDLQ   string `mapstructure:"moderation_dlq"`   // V2 content-free DLQ topic
 }
 
 // ProducerConfig 包含生产者的特定配置

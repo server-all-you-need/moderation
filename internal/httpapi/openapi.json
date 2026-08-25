@@ -1,0 +1,244 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Moderation API",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/api/v1/moderations:check": {
+      "post": {
+        "operationId": "checkModeration",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/ModerationRequest" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ModerationResult" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/moderation-tasks": {
+      "post": {
+        "operationId": "createModerationTask",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+        "requestBody": { "$ref": "#/components/requestBodies/ModerationRequest" },
+        "responses": {
+          "202": { "$ref": "#/components/responses/TaskAccepted" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/moderation-tasks/{id}": {
+      "get": {
+        "operationId": "getModerationTask",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/ResourceID" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Task" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/moderation-batches": {
+      "post": {
+        "operationId": "createModerationBatch",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/IdempotencyKey" }],
+        "requestBody": { "$ref": "#/components/requestBodies/BatchRequest" },
+        "responses": {
+          "202": { "$ref": "#/components/responses/Batch" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/moderation-batches/{id}": {
+      "get": {
+        "operationId": "getModerationBatch",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "$ref": "#/components/parameters/ResourceID" }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Batch" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/v1/moderation-batches/{id}/items": {
+      "get": {
+        "operationId": "listModerationBatchItems",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "$ref": "#/components/parameters/ResourceID" },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+          { "name": "cursor", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/TaskPage" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "429": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": { "type": "http", "scheme": "bearer" }
+    },
+    "parameters": {
+      "Authorization": { "name": "Authorization", "in": "header", "required": true, "schema": { "type": "string" } },
+      "IdempotencyKey": { "name": "Idempotency-Key", "in": "header", "required": true, "schema": { "type": "string", "minLength": 1, "maxLength": 128 } },
+      "ResourceID": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+    },
+    "requestBodies": {
+      "ModerationRequest": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModerationRequest" } } }
+      },
+      "BatchRequest": {
+        "required": true,
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchRequest" } } }
+      }
+    },
+    "responses": {
+      "ModerationResult": { "description": "normalized moderation result", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ModerationResult" } } } },
+      "TaskAccepted": { "description": "accepted task", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskAccepted" } } } },
+      "Task": { "description": "task", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+      "TaskPage": { "description": "task page", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TaskPage" } } } },
+      "Batch": { "description": "batch", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Batch" } } } },
+      "Error": { "description": "stable error envelope", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    },
+    "schemas": {
+      "ModerationRequest": {
+        "type": "object",
+        "required": ["client_item_id", "content_type", "policy"],
+        "additionalProperties": false,
+        "properties": {
+          "client_item_id": { "type": "string", "maxLength": 64 },
+          "content_type": { "type": "string", "enum": ["text", "image"] },
+          "policy": { "type": "string", "enum": ["text.comment", "text.nickname", "text.general", "image.comment", "image.avatar", "image.general"] },
+          "text": { "type": "string" },
+          "image_url": { "type": "string", "format": "uri" },
+          "webhook_url": { "type": "string", "format": "uri" }
+        }
+      },
+      "BatchRequest": {
+        "type": "object",
+        "required": ["items"],
+        "additionalProperties": false,
+        "properties": {
+          "items": { "type": "array", "minItems": 1, "maxItems": 100, "items": { "$ref": "#/components/schemas/ModerationRequest" } },
+          "webhook_url": { "type": "string", "format": "uri" }
+        }
+      },
+      "ModerationResult": {
+        "type": "object",
+        "required": ["client_item_id", "decision", "risk_level", "provider_name"],
+        "properties": {
+          "client_item_id": { "type": "string" },
+          "decision": { "type": "string", "enum": ["pass", "review", "block"] },
+          "risk_level": { "type": "string", "enum": ["none", "low", "medium", "high"] },
+          "provider_name": { "type": "string" },
+          "provider_request_id": { "type": "string" },
+          "provider_data_id": { "type": "string" },
+          "labels": { "type": "array", "items": { "$ref": "#/components/schemas/Label" } }
+        }
+      },
+      "Label": {
+        "type": "object",
+        "properties": {
+          "label": { "type": "string" },
+          "confidence": { "type": "number" },
+          "description": { "type": "string" },
+          "risk_words": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "TaskAccepted": {
+        "type": "object",
+        "required": ["task_id", "status"],
+        "properties": { "task_id": { "type": "string" }, "status": { "type": "string" } }
+      },
+      "Task": {
+        "allOf": [
+          { "$ref": "#/components/schemas/TaskAccepted" },
+          {
+            "type": "object",
+            "properties": {
+              "batch_id": { "type": "string" },
+              "client_item_id": { "type": "string" },
+              "content_type": { "type": "string" },
+              "policy": { "type": "string" },
+              "decision": { "type": "string" },
+              "risk_level": { "type": "string" },
+              "labels": { "type": "array", "items": { "$ref": "#/components/schemas/Label" } },
+              "provider_name": { "type": "string" },
+              "provider_request_id": { "type": "string" },
+              "provider_data_id": { "type": "string" },
+              "error": { "$ref": "#/components/schemas/ErrorDetail" },
+              "attempts": { "type": "integer" },
+              "created_at": { "type": "string", "format": "date-time" },
+              "updated_at": { "type": "string", "format": "date-time" },
+              "terminal_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        ]
+      },
+      "TaskPage": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } },
+          "next_cursor": { "type": "string" }
+        }
+      },
+      "Batch": {
+        "type": "object",
+        "required": ["batch_id", "status", "total", "queued", "processing", "succeeded", "failed"],
+        "properties": {
+          "batch_id": { "type": "string" },
+          "status": { "type": "string" },
+          "total": { "type": "integer" },
+          "queued": { "type": "integer" },
+          "processing": { "type": "integer" },
+          "succeeded": { "type": "integer" },
+          "failed": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "terminal_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": { "error": { "$ref": "#/components/schemas/ErrorDetail" } }
+      },
+      "ErrorDetail": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": { "code": { "type": "string" }, "message": { "type": "string" } }
+      }
+    }
+  }
+}

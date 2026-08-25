@@ -10,3 +10,17 @@ type AliyunConfig struct {
 	TimeoutMs             int64    `mapstructure:"timeout_ms"`              // 调用阿里云接口的超时时间 (毫秒)
 	Scenes                []string `mapstructure:"scenes"`                  // 审核场景/标签列表, 例如 ["ad", "spam", "porn"] <--- 确保此字段存在
 }
+
+func (cfg AliyunConfig) EndpointOrDefault() string {
+	if cfg.Endpoint != "" {
+		return cfg.Endpoint
+	}
+	return "green-cip.cn-shanghai.aliyuncs.com"
+}
+
+func (cfg AliyunConfig) RegionOrDefault() string {
+	if cfg.RegionID != "" {
+		return cfg.RegionID
+	}
+	return "cn-shanghai"
+}

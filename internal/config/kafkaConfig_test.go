@@ -18,10 +18,8 @@ kafka:
   version: "2.8.1"
   consumer_group_id: "test-group"
   topics:
-    pending_moderation: "pending"
-    approved: "approved"
-    rejected: "rejected"
-    dead_letter_queue: "dlq"
+    moderation_tasks: "moderation_tasks_v1"
+    moderation_dlq: "moderation_tasks_dlq_v1"
   producer:
     required_acks: "wait_for_all"
     timeout_ms: 5000
@@ -59,10 +57,8 @@ kafka:
   version: "2.8.1"
   consumer_group_id: "test-group"
   topics:
-    pending_moderation: "pending"
-    approved: "approved"
-    rejected: "rejected"
-    dead_letter_queue: "dlq"
+    moderation_tasks: "moderation_tasks_v1"
+    moderation_dlq: "moderation_tasks_dlq_v1"
   producer:
     required_acks: "wait_for_all"
     timeout_ms: 5000

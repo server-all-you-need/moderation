@@ -252,29 +252,3 @@ func NormalizeRiskLevel(raw string) (RiskLevel, Decision, error) {
 		return "", "", &ProviderError{Code: ErrorCodeProviderResponse, Message: "unknown or missing provider risk level"}
 	}
 }
-
-// TaskData keeps the pre-V2 text batch call surface compiling while Kafka is
-// migrated in a later task.
-type TaskData struct {
-	ID          string                 `json:"id"`
-	Content     string                 `json:"content"`
-	ContentType string                 `json:"contentType,omitempty"`
-	UserID      string                 `json:"userId,omitempty"`
-	CallbackURL string                 `json:"callbackUrl,omitempty"`
-	Extra       map[string]interface{} `json:"extra,omitempty"`
-}
-
-type RejectionDetail struct {
-	Label          string   `json:"label"`
-	Suggestion     string   `json:"suggestion,omitempty"`
-	Score          float64  `json:"score,omitempty"`
-	MatchedContent []string `json:"matchedContent,omitempty"`
-}
-
-type ReviewResult struct {
-	OriginalTaskID string            `json:"originalTaskId"`
-	ProviderTaskID string            `json:"providerTaskId,omitempty"`
-	Suggestion     string            `json:"suggestion"`
-	Details        []RejectionDetail `json:"details,omitempty"`
-	Error          error             `json:"-"`
-}
