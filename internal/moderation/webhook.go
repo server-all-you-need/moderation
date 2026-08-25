@@ -29,19 +29,29 @@ type WebhookHTTPClient interface {
 }
 
 type WebhookDispatcher struct {
-	store *MemoryStore
-	http  WebhookHTTPClient
+	store   WebhookStore
+	secrets SecretResolver
+	http    WebhookHTTPClient
 }
 
-func NewWebhookDispatcher(store *MemoryStore, httpClient WebhookHTTPClient) *WebhookDispatcher {
-	return &WebhookDispatcher{store: store, http: httpClient}
+func NewWebhookDispatcher(store WebhookStore, httpClient WebhookHTTPClient) *WebhookDispatcher {
+	secrets, _ := store.(SecretResolver)
+	return &WebhookDispatcher{store: store, secrets: secrets, http: httpClient}
+}
+
+func NewWebhookDispatcherWithSecretResolver(store WebhookStore, secrets SecretResolver, httpClient WebhookHTTPClient) *WebhookDispatcher {
+	return &WebhookDispatcher{store: store, secrets: secrets, http: httpClient}
 }
 
 func (d *WebhookDispatcher) DispatchDueWebhooks(ctx context.Context, limit int) error {
-	rows := d.store.DueWebhookOutbox(limit)
+	rows := d.store.ClaimDueWebhooks(ctx, limit, 30*time.Second)
 	for _, row := range rows {
 		timestamp := d.store.Now()
-		secret, ok := d.store.webhookSecret(row.CallerID, row.DestinationURL)
+		if d.secrets == nil {
+			d.store.RecordWebhookAttempt(row.ID, 0, ErrWebhookNotAllowed)
+			continue
+		}
+		secret, ok := d.secrets.WebhookSecret(row.CallerID, row.DestinationURL)
 		if !ok {
 			d.store.RecordWebhookAttempt(row.ID, 0, ErrWebhookNotAllowed)
 			continue

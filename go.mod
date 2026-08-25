@@ -3,6 +3,7 @@ module github.com/Xushengqwer/post_audit
 go 1.23.7
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/IBM/sarama v1.45.1
 	github.com/Xushengqwer/go-common v0.0.0-20250609053903-e9d21127601b
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.2.4

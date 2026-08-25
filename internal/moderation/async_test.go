@@ -194,8 +194,7 @@ func TestWorkerRetriesRetryableFailuresThenSendsContentFreeDLQWhenExhausted(t *t
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 4"},
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 5"},
 	}}
-	dlq := &fakeDLQ{}
-	worker := NewWorker(store, provider, dlq)
+	worker := NewWorker(store, provider, nil)
 
 	expectedDelays := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 	for i, delay := range expectedDelays {
@@ -212,11 +211,12 @@ func TestWorkerRetriesRetryableFailuresThenSendsContentFreeDLQWhenExhausted(t *t
 		t.Fatalf("process exhausted attempt: %v", err)
 	}
 	updated, _ := store.Task(task.ID)
-	if updated.Status != TaskStatusFailed || len(dlq.events) != 1 {
-		t.Fatalf("exhausted retries should fail task and send DLQ: task=%#v dlq=%#v", updated, dlq.events)
+	dlqRows := store.DLQOutboxRows()
+	if updated.Status != TaskStatusFailed || len(dlqRows) != 1 {
+		t.Fatalf("exhausted retries should fail task and persist DLQ: task=%#v dlq=%#v", updated, dlqRows)
 	}
-	if strings.Contains(string(dlq.events[0].Value), "sensitive text") || strings.Contains(string(dlq.events[0].Value), "provider-secret") {
-		t.Fatalf("DLQ event leaked content or secret: %s", string(dlq.events[0].Value))
+	if strings.Contains(string(dlqRows[0].Value), "sensitive text") || strings.Contains(string(dlqRows[0].Value), "provider-secret") {
+		t.Fatalf("DLQ event leaked content or secret: %s", string(dlqRows[0].Value))
 	}
 }
 
@@ -233,16 +233,15 @@ func TestWorkerPermanentProviderFailureFailsWithoutRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	dlq := &fakeDLQ{}
 	worker := NewWorker(store, &fakeProvider{errors: []error{
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Retryable: false, Message: "bad request"},
-	}}, dlq)
+	}}, nil)
 
 	if err := worker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
 		t.Fatalf("process permanent failure: %v", err)
 	}
 	updated, _ := store.Task(task.ID)
-	if updated.Status != TaskStatusFailed || updated.NextAttemptAt != nil || len(dlq.events) != 1 {
-		t.Fatalf("permanent failure should terminally fail and DLQ once: task=%#v dlq=%#v", updated, dlq.events)
+	if updated.Status != TaskStatusFailed || updated.NextAttemptAt != nil || len(store.DLQOutboxRows()) != 1 {
+		t.Fatalf("permanent failure should terminally fail and persist DLQ once: task=%#v dlq=%#v", updated, store.DLQOutboxRows())
 	}
 }

@@ -36,7 +36,7 @@ func (h *fakeWebhookHTTP) DoWebhook(_ context.Context, url string, headers http.
 func TestWebhookDestinationMustExactlyMatchCallerAllowlist(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
-	if err := store.RegisterWebhookEndpoint("client-a", "https://hooks.example.com/moderation", "secret-1", "top-secret"); err != nil {
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
 
@@ -60,9 +60,10 @@ func TestWebhookOutboxUsesExactRawBodySignatureAndSchedule(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
 	store := NewMemoryStore(now)
-	if err := store.RegisterWebhookEndpoint("client-a", "https://hooks.example.com/moderation", "secret-1", "top-secret"); err != nil {
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
+	store.SetWebhookSecret("client-a", "secret-1", "top-secret")
 	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
 		CallerID:       "client-a",
 		Operation:      "async_task",
@@ -108,9 +109,10 @@ func TestWebhookDeliveryFailurePersistsAttemptAndDoesNotChangeModerationResult(t
 	ctx := context.Background()
 	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
 	store := NewMemoryStore(now)
-	if err := store.RegisterWebhookEndpoint("client-a", "https://hooks.example.com/moderation", "secret-1", "top-secret"); err != nil {
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
+	store.SetWebhookSecret("client-a", "secret-1", "top-secret")
 	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
 		CallerID:       "client-a",
 		Operation:      "async_task",
@@ -149,9 +151,10 @@ func TestBatchWebhookIsCreatedOnlyAfterWholeBatchReachesTerminalState(t *testing
 	ctx := context.Background()
 	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
 	store := NewMemoryStore(now)
-	if err := store.RegisterWebhookEndpoint("client-a", "https://hooks.example.com/moderation", "secret-1", "top-secret"); err != nil {
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
+	store.SetWebhookSecret("client-a", "secret-1", "top-secret")
 	batch, tasks, _, err := store.CreateBatch(ctx, CreateBatchRequest{
 		CallerID:       "client-a",
 		Operation:      "batch",

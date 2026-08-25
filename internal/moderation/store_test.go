@@ -48,11 +48,13 @@ func TestPostgresMigrationsCoverModerationDurabilityWithoutMutatingLegacyTables(
 
 	requiredTables := []string{
 		"moderation_api_clients",
+		"moderation_webhook_endpoints",
 		"moderation_tasks",
 		"moderation_batches",
 		"moderation_batch_tasks",
 		"moderation_idempotency_keys",
 		"moderation_task_outbox",
+		"moderation_dlq_outbox",
 		"moderation_webhook_outbox",
 		"moderation_webhook_deliveries",
 	}
@@ -63,18 +65,23 @@ func TestPostgresMigrationsCoverModerationDurabilityWithoutMutatingLegacyTables(
 	}
 
 	for _, needle := range []string{
+		"create extension if not exists pgcrypto",
 		"status in ('queued','processing','succeeded','failed')",
 		"status in ('queued','processing','completed','partially_failed','failed')",
 		"create index if not exists idx_moderation_tasks_owner_status",
 		"create index if not exists idx_moderation_tasks_cursor",
 		"create unique index if not exists idx_moderation_idempotency_scope",
+		"create unique index if not exists idx_moderation_webhook_terminal_resource",
+		"body_bytes bytea not null",
+		"event_body bytea not null",
+		"claimed_until timestamptz",
 		"for update skip locked",
 	} {
 		if !strings.Contains(sql, needle) {
 			t.Fatalf("missing schema invariant %q", needle)
 		}
 	}
-	for _, forbidden := range []string{"drop table audit_tasks", "alter table audit_tasks", "drop topic"} {
+	for _, forbidden := range []string{"drop table audit_tasks", "alter table audit_tasks", "drop topic", "body_json jsonb"} {
 		if strings.Contains(sql, forbidden) {
 			t.Fatalf("migration must not mutate legacy artifacts: found %q", forbidden)
 		}
@@ -281,9 +288,10 @@ func TestCleanupExpiredMetadataDeletesWebhookRowsAndIdempotencyReplay(t *testing
 	ctx := context.Background()
 	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
 	store := NewMemoryStore(now)
-	if err := store.RegisterWebhookEndpoint("client-a", "https://hooks.example.com/moderation", "secret-1", "top-secret"); err != nil {
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
 		t.Fatalf("register webhook: %v", err)
 	}
+	store.SetWebhookSecret("client-a", "secret-1", "top-secret")
 	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
 		CallerID:       "client-a",
 		Operation:      "async_task",

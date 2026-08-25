@@ -6,6 +6,8 @@ func PostgresMigrations() []Migration {
 			Version: 1,
 			Name:    "moderation_core_tables",
 			SQL: `
+create extension if not exists pgcrypto;
+
 create table if not exists moderation_api_clients (
   id text primary key,
   name text not null,
@@ -13,6 +15,15 @@ create table if not exists moderation_api_clients (
   scopes text[] not null default '{}',
   created_at timestamptz not null default now(),
   disabled_at timestamptz
+);
+
+create table if not exists moderation_webhook_endpoints (
+  caller_id text not null references moderation_api_clients(id),
+  destination_url text not null,
+  secret_id text not null,
+  created_at timestamptz not null default now(),
+  disabled_at timestamptz,
+  primary key (caller_id, destination_url)
 );
 
 create table if not exists moderation_batches (
@@ -88,6 +99,21 @@ create table if not exists moderation_task_outbox (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+create table if not exists moderation_dlq_outbox (
+  id uuid primary key,
+  task_id uuid not null references moderation_tasks(id) on delete cascade,
+  caller_id text not null,
+  correlation_id text not null,
+  reason text not null,
+  event_body bytea not null,
+  attempts integer not null default 0,
+  claimed_until timestamptz,
+  published_at timestamptz,
+  last_error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 `,
 		},
 		{
@@ -101,9 +127,10 @@ create table if not exists moderation_webhook_outbox (
   resource_id uuid not null,
   destination_url text not null,
   secret_id text not null,
-  body_json jsonb not null,
+  body_bytes bytea not null,
   next_attempt_at timestamptz not null,
   attempts integer not null default 0,
+  claimed_until timestamptz,
   delivered_at timestamptz,
   last_error text,
   created_at timestamptz not null default now(),
@@ -124,8 +151,10 @@ create index if not exists idx_moderation_tasks_owner_status on moderation_tasks
 create index if not exists idx_moderation_tasks_cursor on moderation_tasks(updated_at desc, id desc);
 create index if not exists idx_moderation_batches_owner_status on moderation_batches(caller_id, status, updated_at desc, id desc);
 create index if not exists idx_moderation_task_outbox_claim on moderation_task_outbox(published_at, claimed_until, created_at);
+create index if not exists idx_moderation_dlq_outbox_claim on moderation_dlq_outbox(published_at, claimed_until, created_at);
 create index if not exists idx_moderation_webhook_outbox_due on moderation_webhook_outbox(delivered_at, next_attempt_at, created_at);
 create unique index if not exists idx_moderation_idempotency_scope on moderation_idempotency_keys(caller_id, operation, idempotency_key);
+create unique index if not exists idx_moderation_webhook_terminal_resource on moderation_webhook_outbox(resource_type, resource_id);
 
 -- Claim query used by the transactional outbox publisher:
 -- select id from moderation_task_outbox

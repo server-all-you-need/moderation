@@ -93,6 +93,21 @@ type TaskOutboxRow struct {
 	UpdatedAt     time.Time
 }
 
+type DLQOutboxRow struct {
+	ID            string
+	TaskID        string
+	CallerID      string
+	CorrelationID string
+	Reason        string
+	Value         []byte
+	Attempts      int
+	ClaimedUntil  *time.Time
+	PublishedAt   *time.Time
+	LastError     string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
 type WebhookEndpoint struct {
 	CallerID string
 	URL      string
@@ -109,6 +124,7 @@ type WebhookOutboxRow struct {
 	SecretID       string
 	RawBody        []byte
 	Attempts       int
+	ClaimedUntil   *time.Time
 	NextAttemptAt  time.Time
 	DeliveredAt    *time.Time
 	LastError      string

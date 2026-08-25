@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ type MemoryStore struct {
 	tasks       map[string]Task
 	batches     map[string]Batch
 	outbox      map[string]TaskOutboxRow
+	dlqOutbox   map[string]DLQOutboxRow
 	idem        map[string]idempotencyRecord
 	batchTasks  map[string][]string
 	webhooks    map[string]WebhookEndpoint
@@ -37,6 +39,7 @@ func NewMemoryStore(now time.Time) *MemoryStore {
 		tasks:       map[string]Task{},
 		batches:     map[string]Batch{},
 		outbox:      map[string]TaskOutboxRow{},
+		dlqOutbox:   map[string]DLQOutboxRow{},
 		idem:        map[string]idempotencyRecord{},
 		batchTasks:  map[string][]string{},
 		webhooks:    map[string]WebhookEndpoint{},
@@ -149,6 +152,9 @@ func (s *MemoryStore) CompleteTask(_ context.Context, taskID string, result audi
 	if !ok {
 		return ErrNotFound
 	}
+	if task.Status == TaskStatusSucceeded || task.Status == TaskStatusFailed {
+		return nil
+	}
 	now := s.now
 	task.Status = TaskStatusSucceeded
 	task.Text = nil
@@ -173,6 +179,9 @@ func (s *MemoryStore) FailTask(_ context.Context, taskID string, taskErr TaskErr
 	if !ok {
 		return ErrNotFound
 	}
+	if task.Status == TaskStatusSucceeded || task.Status == TaskStatusFailed {
+		return nil
+	}
 	now := s.now
 	task.Status = TaskStatusFailed
 	task.Text = nil
@@ -187,6 +196,24 @@ func (s *MemoryStore) FailTask(_ context.Context, taskID string, taskErr TaskErr
 	s.deriveBatchLocked(task.BatchID)
 	s.createWebhookForTerminalTaskLocked(task)
 	return nil
+}
+
+func (s *MemoryStore) FailTaskWithDLQ(ctx context.Context, taskID string, taskErr TaskError, reason string) error {
+	s.mu.Lock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		s.mu.Unlock()
+		return ErrNotFound
+	}
+	alreadyTerminal := task.Status == TaskStatusSucceeded || task.Status == TaskStatusFailed
+	s.mu.Unlock()
+	if err := s.FailTask(ctx, taskID, taskErr); err != nil {
+		return err
+	}
+	if alreadyTerminal {
+		return nil
+	}
+	return s.CreateDLQOutbox(ctx, taskID, reason)
 }
 
 func (s *MemoryStore) Task(id string) (Task, bool) {
@@ -235,7 +262,7 @@ func (s *MemoryStore) TaskOutboxRows() []TaskOutboxRow {
 	return out
 }
 
-func (s *MemoryStore) RegisterWebhookEndpoint(callerID, destinationURL, secretID, secret string) error {
+func (s *MemoryStore) RegisterWebhookEndpoint(_ context.Context, callerID, destinationURL, secretID string) error {
 	if err := validateWebhookURL(destinationURL); err != nil {
 		return err
 	}
@@ -245,9 +272,19 @@ func (s *MemoryStore) RegisterWebhookEndpoint(callerID, destinationURL, secretID
 		CallerID: callerID,
 		URL:      destinationURL,
 		SecretID: secretID,
-		secret:   secret,
 	}
 	return nil
+}
+
+func (s *MemoryStore) SetWebhookSecret(callerID, secretID, secret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, endpoint := range s.webhooks {
+		if endpoint.CallerID == callerID && endpoint.SecretID == secretID {
+			endpoint.secret = secret
+			s.webhooks[key] = endpoint
+		}
+	}
 }
 
 func (s *MemoryStore) WebhookOutboxRows() []WebhookOutboxRow {
@@ -270,6 +307,10 @@ func (s *MemoryStore) WebhookDeliveries() []WebhookDelivery {
 }
 
 func (s *MemoryStore) DueWebhookOutbox(limit int) []WebhookOutboxRow {
+	return s.ClaimDueWebhooks(context.Background(), limit, 0)
+}
+
+func (s *MemoryStore) ClaimDueWebhooks(_ context.Context, limit int, lockFor time.Duration) []WebhookOutboxRow {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if limit <= 0 {
@@ -280,11 +321,24 @@ func (s *MemoryStore) DueWebhookOutbox(limit int) []WebhookOutboxRow {
 		if row.DeliveredAt != nil || row.Attempts >= len(WebhookAttemptSchedule()) || row.NextAttemptAt.After(s.now) {
 			continue
 		}
+		if row.ClaimedUntil != nil && row.ClaimedUntil.After(s.now) {
+			continue
+		}
 		rows = append(rows, cloneWebhookOutbox(row))
 	}
 	sortWebhookRows(rows)
 	if len(rows) > limit {
 		rows = rows[:limit]
+	}
+	if lockFor > 0 {
+		claimedUntil := s.now.Add(lockFor)
+		for i := range rows {
+			row := s.webhookRows[rows[i].ID]
+			row.ClaimedUntil = &claimedUntil
+			row.UpdatedAt = s.now
+			s.webhookRows[row.ID] = row
+			rows[i] = cloneWebhookOutbox(row)
+		}
 	}
 	return rows
 }
@@ -306,6 +360,7 @@ func (s *MemoryStore) RecordWebhookAttempt(id string, statusCode int, attemptErr
 	if attemptErr != nil {
 		delivery.Error = attemptErr.Error()
 		row.LastError = attemptErr.Error()
+		row.ClaimedUntil = nil
 		schedule := WebhookAttemptSchedule()
 		if row.Attempts < len(schedule) {
 			row.NextAttemptAt = row.CreatedAt.Add(schedule[row.Attempts])
@@ -314,6 +369,7 @@ func (s *MemoryStore) RecordWebhookAttempt(id string, statusCode int, attemptErr
 		deliveredAt := s.now
 		row.DeliveredAt = &deliveredAt
 		row.LastError = ""
+		row.ClaimedUntil = nil
 	}
 	row.UpdatedAt = s.now
 	s.webhookRows[id] = row
@@ -383,6 +439,38 @@ func (s *MemoryStore) MarkTaskOutboxFailed(_ context.Context, id, message string
 	s.outbox[id] = row
 }
 
+func (s *MemoryStore) RequeueDueRetries(_ context.Context, limit int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		return 0, nil
+	}
+	tasks := make([]Task, 0, len(s.tasks))
+	for _, task := range s.tasks {
+		if task.Status != TaskStatusQueued || task.NextAttemptAt == nil || task.NextAttemptAt.After(s.now) {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].NextAttemptAt.Equal(*tasks[j].NextAttemptAt) {
+			return tasks[i].ID < tasks[j].ID
+		}
+		return tasks[i].NextAttemptAt.Before(*tasks[j].NextAttemptAt)
+	})
+	if len(tasks) > limit {
+		tasks = tasks[:limit]
+	}
+	for _, task := range tasks {
+		task.NextAttemptAt = nil
+		task.UpdatedAt = s.now
+		s.tasks[task.ID] = task
+		row := taskOutboxFromTask(task, s.now)
+		s.outbox[row.ID] = row
+	}
+	return len(tasks), nil
+}
+
 func (s *MemoryStore) ClaimTaskForProcessing(_ context.Context, taskID string, lockFor time.Duration) (Task, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -423,11 +511,121 @@ func (s *MemoryStore) ScheduleTaskRetry(_ context.Context, taskID string, delay 
 	task.Status = TaskStatusQueued
 	task.NextAttemptAt = &nextAttemptAt
 	task.ClaimedUntil = nil
-	task.Error = &TaskError{Code: auditplatform.ErrorCodeProviderTemporary, Message: message}
+	code := auditplatform.ErrorCodeProviderTemporary
+	if strings.HasPrefix(message, "rate_limiter_unavailable:") {
+		code = "rate_limiter_unavailable"
+	}
+	if strings.HasPrefix(message, "rate_limited:") {
+		code = "rate_limited"
+	}
+	task.Error = &TaskError{Code: code, Message: message}
 	task.UpdatedAt = s.now
 	s.tasks[taskID] = task
 	s.deriveBatchLocked(task.BatchID)
 	return nil
+}
+
+func (s *MemoryStore) CreateDLQOutbox(_ context.Context, taskID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return ErrNotFound
+	}
+	event := DLQEvent{
+		Version:       1,
+		TaskID:        task.ID,
+		CallerID:      task.CallerID,
+		CorrelationID: task.CorrelationID,
+		Reason:        reason,
+	}
+	value, err := marshalDLQEvent(event)
+	if err != nil {
+		return err
+	}
+	row := DLQOutboxRow{
+		ID:            uuid.NewString(),
+		TaskID:        task.ID,
+		CallerID:      task.CallerID,
+		CorrelationID: task.CorrelationID,
+		Reason:        reason,
+		Value:         value,
+		CreatedAt:     s.now,
+		UpdatedAt:     s.now,
+	}
+	s.dlqOutbox[row.ID] = row
+	return nil
+}
+
+func (s *MemoryStore) DLQOutboxRows() []DLQOutboxRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]DLQOutboxRow, 0, len(s.dlqOutbox))
+	for _, row := range s.dlqOutbox {
+		out = append(out, cloneDLQOutbox(row))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) || out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *MemoryStore) ClaimDLQOutbox(_ context.Context, limit int, lockFor time.Duration) []DLQOutboxRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if limit <= 0 {
+		return nil
+	}
+	rows := make([]DLQOutboxRow, 0, len(s.dlqOutbox))
+	for _, row := range s.dlqOutbox {
+		if row.PublishedAt != nil {
+			continue
+		}
+		if row.ClaimedUntil != nil && row.ClaimedUntil.After(s.now) {
+			continue
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) || rows[i].ID < rows[j].ID })
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	claimedUntil := s.now.Add(lockFor)
+	for i := range rows {
+		row := s.dlqOutbox[rows[i].ID]
+		row.ClaimedUntil = &claimedUntil
+		row.Attempts++
+		row.UpdatedAt = s.now
+		s.dlqOutbox[row.ID] = row
+		rows[i] = cloneDLQOutbox(row)
+	}
+	return rows
+}
+
+func (s *MemoryStore) MarkDLQOutboxPublished(_ context.Context, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.dlqOutbox[id]
+	if !ok {
+		return
+	}
+	now := s.now
+	row.PublishedAt = &now
+	row.ClaimedUntil = nil
+	row.LastError = ""
+	row.UpdatedAt = now
+	s.dlqOutbox[id] = row
+}
+
+func (s *MemoryStore) MarkDLQOutboxFailed(_ context.Context, id, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row, ok := s.dlqOutbox[id]
+	if !ok {
+		return
+	}
+	row.ClaimedUntil = nil
+	row.LastError = message
+	row.UpdatedAt = s.now
+	s.dlqOutbox[id] = row
 }
 
 func (s *MemoryStore) CleanupExpired(_ context.Context, retention time.Duration, limit int) int {
@@ -462,11 +660,40 @@ func (s *MemoryStore) CleanupExpired(_ context.Context, retention time.Duration,
 				delete(s.outbox, outboxID)
 			}
 		}
+		for dlqID, row := range s.dlqOutbox {
+			if row.TaskID == c.id {
+				delete(s.dlqOutbox, dlqID)
+			}
+		}
 		deletedWebhookIDs := map[string]struct{}{}
 		for webhookID, row := range s.webhookRows {
 			if row.ResourceType == "task" && row.ResourceID == c.id {
 				deletedWebhookIDs[webhookID] = struct{}{}
 				delete(s.webhookRows, webhookID)
+			}
+		}
+		for key, rec := range s.idem {
+			if rec.resourceID == c.id {
+				delete(s.idem, key)
+			}
+		}
+		if task.BatchID != "" {
+			s.removeBatchTaskLocked(task.BatchID, task.ID)
+			s.deriveBatchLocked(task.BatchID)
+			if len(s.batchTasks[task.BatchID]) == 0 {
+				for webhookID, row := range s.webhookRows {
+					if row.ResourceType == "batch" && row.ResourceID == task.BatchID {
+						deletedWebhookIDs[webhookID] = struct{}{}
+						delete(s.webhookRows, webhookID)
+					}
+				}
+				for key, rec := range s.idem {
+					if rec.resourceID == task.BatchID {
+						delete(s.idem, key)
+					}
+				}
+				delete(s.batchTasks, task.BatchID)
+				delete(s.batches, task.BatchID)
 			}
 		}
 		if len(deletedWebhookIDs) > 0 {
@@ -478,15 +705,6 @@ func (s *MemoryStore) CleanupExpired(_ context.Context, retention time.Duration,
 				keptDeliveries = append(keptDeliveries, delivery)
 			}
 			s.deliveries = keptDeliveries
-		}
-		for key, rec := range s.idem {
-			if rec.resourceID == c.id {
-				delete(s.idem, key)
-			}
-		}
-		if task.BatchID != "" {
-			s.removeBatchTaskLocked(task.BatchID, task.ID)
-			s.deriveBatchLocked(task.BatchID)
 		}
 		deleted++
 	}
@@ -628,7 +846,7 @@ func (s *MemoryStore) webhookAllowedLocked(callerID, destinationURL string) bool
 	return ok
 }
 
-func (s *MemoryStore) webhookSecret(callerID, destinationURL string) (string, bool) {
+func (s *MemoryStore) WebhookSecret(callerID, destinationURL string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	endpoint, ok := s.webhooks[webhookKey(callerID, destinationURL)]
@@ -636,6 +854,10 @@ func (s *MemoryStore) webhookSecret(callerID, destinationURL string) (string, bo
 		return "", false
 	}
 	return endpoint.secret, true
+}
+
+func (s *MemoryStore) webhookSecret(callerID, destinationURL string) (string, bool) {
+	return s.WebhookSecret(callerID, destinationURL)
 }
 
 func (s *MemoryStore) removeBatchTaskLocked(batchID, taskID string) {
@@ -728,6 +950,23 @@ func cloneWebhookOutbox(row WebhookOutboxRow) WebhookOutboxRow {
 	if row.DeliveredAt != nil {
 		value := *row.DeliveredAt
 		row.DeliveredAt = &value
+	}
+	if row.ClaimedUntil != nil {
+		value := *row.ClaimedUntil
+		row.ClaimedUntil = &value
+	}
+	return row
+}
+
+func cloneDLQOutbox(row DLQOutboxRow) DLQOutboxRow {
+	row.Value = append([]byte(nil), row.Value...)
+	if row.ClaimedUntil != nil {
+		value := *row.ClaimedUntil
+		row.ClaimedUntil = &value
+	}
+	if row.PublishedAt != nil {
+		value := *row.PublishedAt
+		row.PublishedAt = &value
 	}
 	return row
 }

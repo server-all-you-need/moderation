@@ -66,7 +66,7 @@ func MarshalTaskEvent(event TaskEvent) ([]byte, error) {
 	return json.Marshal(event)
 }
 
-func PublishTaskOutbox(ctx context.Context, store *MemoryStore, publisher Publisher, limit int, lockFor time.Duration) error {
+func PublishTaskOutbox(ctx context.Context, store TaskOutboxStore, publisher Publisher, limit int, lockFor time.Duration) error {
 	rows := store.ClaimTaskOutbox(ctx, limit, lockFor)
 	var firstErr error
 	for _, row := range rows {
@@ -96,19 +96,52 @@ func PublishTaskOutbox(ctx context.Context, store *MemoryStore, publisher Publis
 }
 
 type Worker struct {
-	store    *MemoryStore
-	provider auditplatform.Provider
-	dlq      DLQSender
+	store          WorkerStore
+	provider       auditplatform.Provider
+	providerBudget ProviderBudget
+	claimFor       time.Duration
 }
 
 func NewWorker(store *MemoryStore, provider auditplatform.Provider, dlq DLQSender) *Worker {
-	return &Worker{store: store, provider: provider, dlq: dlq}
+	_ = dlq
+	return NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ClaimFor: 30 * time.Second})
+}
+
+type WorkerOptions struct {
+	Store          WorkerStore
+	Provider       auditplatform.Provider
+	DLQ            DLQOutboxStore
+	ProviderBudget ProviderBudget
+	ClaimFor       time.Duration
+}
+
+func NewWorkerWithOptions(options WorkerOptions) *Worker {
+	claimFor := options.ClaimFor
+	if claimFor <= 0 {
+		claimFor = 30 * time.Second
+	}
+	budget := options.ProviderBudget
+	if budget == nil {
+		budget = allowAllProviderBudget{}
+	}
+	return &Worker{store: options.Store, provider: options.Provider, providerBudget: budget, claimFor: claimFor}
 }
 
 func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
-	task, claimed, err := w.store.ClaimTaskForProcessing(ctx, event.TaskID, 30*time.Second)
+	task, claimed, err := w.store.ClaimTaskForProcessing(ctx, event.TaskID, w.claimFor)
 	if err != nil || !claimed {
 		return err
+	}
+
+	outcome, budgetErr := w.providerBudget.AcquireAsyncProvider(ctx)
+	if budgetErr != nil || !outcome.Allowed {
+		code := "rate_limited"
+		message := string(outcome.Reason)
+		if budgetErr != nil {
+			code = "rate_limiter_unavailable"
+			message = budgetErr.Error()
+		}
+		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), messageWithCode(code, message))
 	}
 
 	input, err := inputFromTask(task)
@@ -122,8 +155,7 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 
 	var providerErr *auditplatform.ProviderError
 	if errors.As(err, &providerErr) && providerErr.Retryable && task.Attempts < 5 {
-		delay := RetryDelays[task.Attempts-1]
-		return w.store.ScheduleTaskRetry(ctx, task.ID, delay, providerErr.Error())
+		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), providerErr.Error())
 	}
 	taskErr := TaskError{Code: auditplatform.ErrorCodeProviderResponse, Message: err.Error()}
 	if providerErr != nil {
@@ -133,25 +165,52 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 }
 
 func (w *Worker) failAndDLQ(ctx context.Context, task Task, taskErr TaskError, reason string) error {
-	if err := w.store.FailTask(ctx, task.ID, taskErr); err != nil {
-		return err
+	return w.store.FailTaskWithDLQ(ctx, task.ID, taskErr, reason)
+}
+
+func retryDelayForAttempt(attempt int) time.Duration {
+	if attempt <= 0 {
+		return RetryDelays[0]
 	}
-	event := DLQEvent{
-		Version:       1,
-		TaskID:        task.ID,
-		CallerID:      task.CallerID,
-		CorrelationID: task.CorrelationID,
-		Reason:        reason,
+	index := attempt - 1
+	if index >= len(RetryDelays) {
+		return RetryDelays[len(RetryDelays)-1]
 	}
-	value, err := json.Marshal(event)
-	if err != nil {
-		return err
+	return RetryDelays[index]
+}
+
+func messageWithCode(code, message string) string {
+	if message == "" {
+		return code
 	}
-	event.Value = value
-	if w.dlq == nil {
-		return nil
+	return code + ": " + message
+}
+
+func RequeueDueRetries(ctx context.Context, store RetryStore, limit int) (int, error) {
+	return store.RequeueDueRetries(ctx, limit)
+}
+
+func PublishDLQOutbox(ctx context.Context, store DLQOutboxStore, publisher Publisher, limit int, lockFor time.Duration) error {
+	rows := store.ClaimDLQOutbox(ctx, limit, lockFor)
+	var firstErr error
+	for _, row := range rows {
+		if err := publisher.Publish(ctx, TopicModerationTaskDLQ, row.TaskID, row.Value); err != nil {
+			store.MarkDLQOutboxFailed(ctx, row.ID, err.Error())
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		store.MarkDLQOutboxPublished(ctx, row.ID)
 	}
-	return w.dlq.SendDLQ(ctx, event)
+	return firstErr
+}
+
+func marshalDLQEvent(event DLQEvent) ([]byte, error) {
+	if event.Version == 0 {
+		event.Version = 1
+	}
+	return json.Marshal(event)
 }
 
 func inputFromTask(task Task) (auditplatform.ModerationInput, error) {
