@@ -259,21 +259,42 @@ func providerStatusError(httpStatus, bodyCode int32) error {
 	if httpStatus == 200 && bodyCode == 200 {
 		return nil
 	}
-	if httpStatus == 429 || bodyCode == 429 {
-		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeThrottled, Retryable: true, Message: "aliyun throttled"}
+	if bodyCode != 0 && bodyCode != 200 {
+		return providerBodyCodeError(bodyCode)
 	}
-	status := bodyCode
-	if status == 0 {
-		status = httpStatus
+	return providerHTTPStatusError(httpStatus)
+}
+
+func providerBodyCodeError(code int32) error {
+	switch code {
+	case 403, 429, 588:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeThrottled, Retryable: true, Message: "aliyun throttled"}
+	case 408:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodePermission, Message: "aliyun permission error"}
+	case 581:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeTimeout, Retryable: true, Message: "aliyun request timeout"}
+	}
+	if code >= 500 {
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: fmt.Sprintf("aliyun provider temporary error: %d", code)}
+	}
+	return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Message: fmt.Sprintf("aliyun invalid request: %d", code)}
+}
+
+func providerHTTPStatusError(status int32) error {
+	switch status {
+	case 200:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Message: "aliyun invalid request"}
+	case 401:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeAuthentication, Message: "aliyun authentication error"}
+	case 403:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodePermission, Message: "aliyun permission error"}
+	case 408:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeTimeout, Retryable: true, Message: "aliyun request timeout"}
+	case 429:
+		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeThrottled, Retryable: true, Message: "aliyun throttled"}
 	}
 	if status >= 500 {
 		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: fmt.Sprintf("aliyun provider temporary error: %d", status)}
-	}
-	if status == 401 {
-		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeAuthentication, Message: "aliyun authentication error"}
-	}
-	if status == 403 {
-		return &auditplatform.ProviderError{Code: auditplatform.ErrorCodePermission, Message: "aliyun permission error"}
 	}
 	return &auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Message: fmt.Sprintf("aliyun invalid request: %d", status)}
 }

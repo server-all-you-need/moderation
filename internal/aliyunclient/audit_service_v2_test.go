@@ -254,6 +254,96 @@ func TestModerateClassifiesProviderErrorsRetryability(t *testing.T) {
 	}
 }
 
+func TestProviderStatusErrorClassifiesHTTPStatusAndProviderBodyCodeSeparately(t *testing.T) {
+	tests := []struct {
+		name       string
+		httpStatus int32
+		bodyCode   int32
+		code       string
+		retryable  bool
+	}{
+		{
+			name:       "provider body 408 is permanent permission denial",
+			httpStatus: 200,
+			bodyCode:   408,
+			code:       auditplatform.ErrorCodePermission,
+			retryable:  false,
+		},
+		{
+			name:       "provider body 581 is retryable timeout",
+			httpStatus: 200,
+			bodyCode:   581,
+			code:       auditplatform.ErrorCodeTimeout,
+			retryable:  true,
+		},
+		{
+			name:       "provider body 588 is retryable throttling",
+			httpStatus: 200,
+			bodyCode:   588,
+			code:       auditplatform.ErrorCodeThrottled,
+			retryable:  true,
+		},
+		{
+			name:       "image provider body 403 is retryable throttling",
+			httpStatus: 200,
+			bodyCode:   403,
+			code:       auditplatform.ErrorCodeThrottled,
+			retryable:  true,
+		},
+		{
+			name:       "image provider body 401 is permanent invalid request",
+			httpStatus: 200,
+			bodyCode:   401,
+			code:       auditplatform.ErrorCodeInvalidRequest,
+			retryable:  false,
+		},
+		{
+			name:       "http 401 without provider body code is authentication",
+			httpStatus: 401,
+			bodyCode:   0,
+			code:       auditplatform.ErrorCodeAuthentication,
+			retryable:  false,
+		},
+		{
+			name:       "http 403 without provider body code is permission",
+			httpStatus: 403,
+			bodyCode:   0,
+			code:       auditplatform.ErrorCodePermission,
+			retryable:  false,
+		},
+		{
+			name:       "http 408 without provider body code is retryable timeout",
+			httpStatus: 408,
+			bodyCode:   0,
+			code:       auditplatform.ErrorCodeTimeout,
+			retryable:  true,
+		},
+		{
+			name:       "http 429 is retryable throttling",
+			httpStatus: 429,
+			bodyCode:   0,
+			code:       auditplatform.ErrorCodeThrottled,
+			retryable:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := providerStatusError(tt.httpStatus, tt.bodyCode)
+			if err == nil {
+				t.Fatal("providerStatusError() returned nil, want ProviderError")
+			}
+			var providerErr *auditplatform.ProviderError
+			if !errors.As(err, &providerErr) {
+				t.Fatalf("error = %T, want *ProviderError", err)
+			}
+			if providerErr.Code != tt.code || providerErr.Retryable != tt.retryable {
+				t.Fatalf("ProviderError = code %q retryable %v, want %q %v", providerErr.Code, providerErr.Retryable, tt.code, tt.retryable)
+			}
+		})
+	}
+}
+
 func textResponse(httpStatus, bodyCode int32, requestID, risk string) *green.TextModerationPlusResponse {
 	resp := (&green.TextModerationPlusResponse{}).SetStatusCode(httpStatus)
 	body := (&green.TextModerationPlusResponseBody{}).SetCode(bodyCode).SetRequestId(requestID)
