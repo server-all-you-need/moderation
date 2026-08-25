@@ -144,6 +144,10 @@ func (w *Worker) ProcessTaskEvent(ctx context.Context, event TaskEvent) error {
 		return w.store.ScheduleTaskRetry(ctx, task.ID, retryDelayForAttempt(task.Attempts), messageWithCode(code, message))
 	}
 
+	task, err = w.store.BeginProviderAttempt(ctx, task.ID)
+	if err != nil {
+		return err
+	}
 	input, err := inputFromTask(task)
 	if err != nil {
 		return w.failAndDLQ(ctx, task, TaskError{Code: auditplatform.ErrorCodeInvalidInput, Message: err.Error()}, "missing_input")

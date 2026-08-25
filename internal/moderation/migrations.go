@@ -128,6 +128,7 @@ create table if not exists moderation_webhook_outbox (
   destination_url text not null,
   secret_id text not null,
   body_bytes bytea not null,
+  claim_token text,
   next_attempt_at timestamptz not null,
   attempts integer not null default 0,
   claimed_until timestamptz,

@@ -117,6 +117,7 @@ type WebhookEndpoint struct {
 
 type WebhookOutboxRow struct {
 	ID             string
+	ClaimToken     string
 	CallerID       string
 	ResourceType   string
 	ResourceID     string

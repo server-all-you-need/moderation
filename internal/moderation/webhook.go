@@ -35,7 +35,10 @@ type WebhookDispatcher struct {
 }
 
 func NewWebhookDispatcher(store WebhookStore, httpClient WebhookHTTPClient) *WebhookDispatcher {
-	secrets, _ := store.(SecretResolver)
+	secrets, ok := store.(SecretResolver)
+	if !ok {
+		panic("moderation webhook dispatcher requires an explicit SecretResolver")
+	}
 	return &WebhookDispatcher{store: store, secrets: secrets, http: httpClient}
 }
 
@@ -48,12 +51,12 @@ func (d *WebhookDispatcher) DispatchDueWebhooks(ctx context.Context, limit int) 
 	for _, row := range rows {
 		timestamp := d.store.Now()
 		if d.secrets == nil {
-			d.store.RecordWebhookAttempt(row.ID, 0, ErrWebhookNotAllowed)
+			d.store.RecordWebhookAttempt(ctx, row.ID, row.ClaimToken, 0, ErrWebhookNotAllowed)
 			continue
 		}
 		secret, ok := d.secrets.WebhookSecret(row.CallerID, row.DestinationURL)
 		if !ok {
-			d.store.RecordWebhookAttempt(row.ID, 0, ErrWebhookNotAllowed)
+			d.store.RecordWebhookAttempt(ctx, row.ID, row.ClaimToken, 0, ErrWebhookNotAllowed)
 			continue
 		}
 		headers := http.Header{}
@@ -65,7 +68,7 @@ func (d *WebhookDispatcher) DispatchDueWebhooks(ctx context.Context, limit int) 
 		if err == nil && (statusCode < 200 || statusCode >= 300) {
 			err = fmt.Errorf("webhook returned status %d", statusCode)
 		}
-		d.store.RecordWebhookAttempt(row.ID, statusCode, err)
+		d.store.RecordWebhookAttempt(ctx, row.ID, row.ClaimToken, statusCode, err)
 	}
 	return nil
 }

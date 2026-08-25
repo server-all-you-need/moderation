@@ -334,6 +334,7 @@ func (s *MemoryStore) ClaimDueWebhooks(_ context.Context, limit int, lockFor tim
 		claimedUntil := s.now.Add(lockFor)
 		for i := range rows {
 			row := s.webhookRows[rows[i].ID]
+			row.ClaimToken = uuid.NewString()
 			row.ClaimedUntil = &claimedUntil
 			row.UpdatedAt = s.now
 			s.webhookRows[row.ID] = row
@@ -343,12 +344,15 @@ func (s *MemoryStore) ClaimDueWebhooks(_ context.Context, limit int, lockFor tim
 	return rows
 }
 
-func (s *MemoryStore) RecordWebhookAttempt(id string, statusCode int, attemptErr error) {
+func (s *MemoryStore) RecordWebhookAttempt(_ context.Context, id, claimToken string, statusCode int, attemptErr error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	row, ok := s.webhookRows[id]
 	if !ok {
-		return
+		return false
+	}
+	if row.ClaimToken == "" || row.ClaimToken != claimToken {
+		return false
 	}
 	row.Attempts++
 	delivery := WebhookDelivery{
@@ -374,6 +378,7 @@ func (s *MemoryStore) RecordWebhookAttempt(id string, statusCode int, attemptErr
 	row.UpdatedAt = s.now
 	s.webhookRows[id] = row
 	s.deliveries = append(s.deliveries, delivery)
+	return true
 }
 
 func (s *MemoryStore) ClaimTaskOutbox(_ context.Context, limit int, lockFor time.Duration) []TaskOutboxRow {
@@ -491,12 +496,27 @@ func (s *MemoryStore) ClaimTaskForProcessing(_ context.Context, taskID string, l
 
 	claimedUntil := s.now.Add(lockFor)
 	task.Status = TaskStatusProcessing
-	task.Attempts++
 	task.ClaimedUntil = &claimedUntil
 	task.UpdatedAt = s.now
 	s.tasks[taskID] = task
 	s.deriveBatchLocked(task.BatchID)
 	return cloneTask(task), true, nil
+}
+
+func (s *MemoryStore) BeginProviderAttempt(_ context.Context, taskID string) (Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.tasks[taskID]
+	if !ok {
+		return Task{}, ErrNotFound
+	}
+	if task.Status != TaskStatusProcessing {
+		return Task{}, ErrConflict
+	}
+	task.Attempts++
+	task.UpdatedAt = s.now
+	s.tasks[taskID] = task
+	return cloneTask(task), nil
 }
 
 func (s *MemoryStore) ScheduleTaskRetry(_ context.Context, taskID string, delay time.Duration, message string) error {

@@ -74,7 +74,13 @@ for update`, req.CallerID, req.Operation, req.IdempotencyKey).Scan(&payloadHash,
 		if payloadHash != req.PayloadHash {
 			return Task{}, false, ErrIdempotencyConflict
 		}
-		task := Task{ID: resourceID, CallerID: req.CallerID, Status: TaskStatusQueued}
+		if resourceType != "task" {
+			return Task{}, false, ErrIdempotencyConflict
+		}
+		task, err := s.loadTaskTx(ctx, tx, resourceID)
+		if err != nil {
+			return Task{}, false, err
+		}
 		return task, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -155,10 +161,17 @@ for update`, req.CallerID, req.Operation, req.IdempotencyKey).Scan(&payloadHash,
 		if payloadHash != req.PayloadHash {
 			return Batch{}, nil, false, ErrIdempotencyConflict
 		}
+		if resourceType != "batch" {
+			return Batch{}, nil, false, ErrIdempotencyConflict
+		}
+		batch, tasks, err := s.loadBatchTx(ctx, tx, resourceID)
+		if err != nil {
+			return Batch{}, nil, false, err
+		}
 		if err = tx.Commit(); err != nil {
 			return Batch{}, nil, false, err
 		}
-		return Batch{ID: resourceID, CallerID: req.CallerID}, nil, true, nil
+		return batch, tasks, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Batch{}, nil, false, err
@@ -306,16 +319,43 @@ for update skip locked`, taskID)
 		task.ImageURL = &imageURL
 	}
 	claimedUntil := s.now().Add(lockFor)
-	task.Attempts++
 	task.Status = TaskStatusProcessing
 	task.ClaimedUntil = &claimedUntil
-	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'processing', attempts = attempts + 1, claimed_until = $1, updated_at = $2 where id = $3 and status in ('queued','processing')`, claimedUntil, s.now(), task.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'processing', claimed_until = $1, updated_at = $2 where id = $3 and status in ('queued','processing')`, claimedUntil, s.now(), task.ID); err != nil {
 		return Task{}, false, err
+	}
+	if task.BatchID != "" {
+		if err = s.deriveBatchTx(ctx, tx, task.BatchID); err != nil {
+			return Task{}, false, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return Task{}, false, err
 	}
 	return task, true, nil
+}
+
+func (s *PostgresStore) BeginProviderAttempt(ctx context.Context, taskID string) (Task, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Task{}, err
+	}
+	defer rollbackUnlessDone(tx, &err)
+	task, err := s.loadTaskTx(ctx, tx, taskID)
+	if err != nil {
+		return Task{}, err
+	}
+	if task.Status != TaskStatusProcessing {
+		return Task{}, ErrConflict
+	}
+	task.Attempts++
+	if _, err = tx.ExecContext(ctx, `update moderation_tasks set attempts = attempts + 1, updated_at = $1 where id = $2 and status = 'processing'`, s.now(), taskID); err != nil {
+		return Task{}, err
+	}
+	if err = tx.Commit(); err != nil {
+		return Task{}, err
+	}
+	return task, nil
 }
 
 func (s *PostgresStore) CompleteTask(ctx context.Context, taskID string, result auditplatform.ModerationResult) error {
@@ -402,8 +442,25 @@ func (s *PostgresStore) failTaskTxWrapper(ctx context.Context, taskID string, ta
 }
 
 func (s *PostgresStore) ScheduleTaskRetry(ctx context.Context, taskID string, delay time.Duration, message string) error {
-	_, err := s.db.ExecContext(ctx, `update moderation_tasks set status = 'queued', next_attempt_at = $1, claimed_until = null, error_json = $2, updated_at = $3 where id = $4 and status = 'processing'`, s.now().Add(delay), []byte(fmt.Sprintf(`{"code":"provider_temporary","message":%q}`, message)), s.now(), taskID)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer rollbackUnlessDone(tx, &err)
+	var batchID string
+	err = tx.QueryRowContext(ctx, `select coalesce(batch_id::text, '') from moderation_tasks where id = $1 for update`, taskID).Scan(&batchID)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'queued', next_attempt_at = $1, claimed_until = null, error_json = $2, updated_at = $3 where id = $4 and status = 'processing'`, s.now().Add(delay), []byte(fmt.Sprintf(`{"code":"provider_temporary","message":%q}`, message)), s.now(), taskID); err != nil {
+		return err
+	}
+	if batchID != "" {
+		if err = s.deriveBatchTx(ctx, tx, batchID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *PostgresStore) RequeueDueRetries(ctx context.Context, limit int) (int, error) {
@@ -479,9 +536,10 @@ func (s *PostgresStore) RegisterWebhookEndpoint(ctx context.Context, callerID, d
 }
 
 func (s *PostgresStore) ClaimDueWebhooks(ctx context.Context, limit int, lockFor time.Duration) []WebhookOutboxRow {
+	claimToken := uuid.NewString()
 	rows, err := s.db.QueryContext(ctx, `
 update moderation_webhook_outbox
-set claimed_until = $1, updated_at = $2
+set claim_token = $1, claimed_until = $2, updated_at = $3
 where id in (
   select id from moderation_webhook_outbox
   where delivered_at is null
@@ -489,10 +547,10 @@ where id in (
     and next_attempt_at <= now()
     and (claimed_until is null or claimed_until < now())
   order by next_attempt_at, created_at
-  limit $3
+  limit $4
   for update skip locked
 )
-returning id, caller_id, resource_type, resource_id, destination_url, secret_id, body_bytes, attempts, next_attempt_at, created_at, updated_at`, s.now().Add(lockFor), s.now(), limit)
+returning id, caller_id, resource_type, resource_id, destination_url, secret_id, body_bytes, attempts, next_attempt_at, created_at, updated_at`, claimToken, s.now().Add(lockFor), s.now(), limit)
 	if err != nil {
 		return nil
 	}
@@ -503,23 +561,23 @@ returning id, caller_id, resource_type, resource_id, destination_url, secret_id,
 		if err := rows.Scan(&row.ID, &row.CallerID, &row.ResourceType, &row.ResourceID, &row.DestinationURL, &row.SecretID, &row.RawBody, &row.Attempts, &row.NextAttemptAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return nil
 		}
+		row.ClaimToken = claimToken
 		claimed = append(claimed, row)
 	}
 	return claimed
 }
 
-func (s *PostgresStore) RecordWebhookAttempt(id string, statusCode int, attemptErr error) {
-	ctx := context.Background()
+func (s *PostgresStore) RecordWebhookAttempt(ctx context.Context, id, claimToken string, statusCode int, attemptErr error) (ok bool) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return
+		return false
 	}
 	defer rollbackUnlessDone(tx, &err)
 	var attempts int
 	var createdAt time.Time
-	err = tx.QueryRowContext(ctx, `select attempts, created_at from moderation_webhook_outbox where id = $1 for update`, id).Scan(&attempts, &createdAt)
+	err = tx.QueryRowContext(ctx, `select attempts, created_at from moderation_webhook_outbox where id = $1 and claim_token = $2 for update`, id, claimToken).Scan(&attempts, &createdAt)
 	if err != nil {
-		return
+		return false
 	}
 	attempts++
 	errorMessage := ""
@@ -540,39 +598,58 @@ func (s *PostgresStore) RecordWebhookAttempt(id string, statusCode int, attemptE
 	}
 	_, err = tx.ExecContext(ctx, `update moderation_webhook_outbox set attempts = $1, claimed_until = null, next_attempt_at = $2, delivered_at = $3, last_error = $4, updated_at = $5 where id = $6`, attempts, nextAttempt, deliveredAt, nullablePlainString(errorMessage), s.now(), id)
 	if err != nil {
-		return
+		return false
 	}
-	err = tx.Commit()
-}
-
-func (s *PostgresStore) WebhookSecret(string, string) (string, bool) {
-	return "", false
+	if err = tx.Commit(); err != nil {
+		return false
+	}
+	return true
 }
 
 func (s *PostgresStore) CleanupExpired(ctx context.Context, retention time.Duration, limit int) int {
-	res, err := s.db.ExecContext(ctx, `
-with old_tasks as (
-  select id from moderation_tasks
-  where terminal_at < $1
-  order by terminal_at
-  limit $2
-), old_batches as (
-  select b.id from moderation_batches b
-  where b.terminal_at < $1
-    and not exists (select 1 from moderation_tasks t where t.batch_id = b.id)
-  limit $2
-)
-delete from moderation_tasks where id in (select id from old_tasks)`, s.now().Add(-retention), limit)
+	deleted, err := s.CleanupExpiredWithError(ctx, retention, limit)
 	if err != nil {
 		return 0
 	}
-	count, _ := res.RowsAffected()
-	_, _ = s.db.ExecContext(ctx, `delete from moderation_batches where terminal_at < $1 and not exists (select 1 from moderation_tasks where batch_id = moderation_batches.id)`, s.now().Add(-retention))
-	_, _ = s.db.ExecContext(ctx, `delete from moderation_idempotency_keys where created_at < $1`, s.now().Add(-retention))
-	_, _ = s.db.ExecContext(ctx, `delete from moderation_task_outbox where published_at < $1`, s.now().Add(-retention))
-	_, _ = s.db.ExecContext(ctx, `delete from moderation_dlq_outbox where coalesce(published_at, created_at) < $1`, s.now().Add(-retention))
-	_, _ = s.db.ExecContext(ctx, `delete from moderation_webhook_outbox where coalesce(delivered_at, created_at) < $1`, s.now().Add(-retention))
-	return int(count)
+	return deleted
+}
+
+func (s *PostgresStore) CleanupExpiredWithError(ctx context.Context, retention time.Duration, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer rollbackUnlessDone(tx, &err)
+	cutoff := s.now().Add(-retention)
+	statements := []string{
+		`delete from moderation_webhook_deliveries where id in (select id from moderation_webhook_deliveries where created_at < $1 order by created_at limit $2)`,
+		`delete from moderation_webhook_outbox where id in (select id from moderation_webhook_outbox where coalesce(delivered_at, created_at) < $1 order by created_at limit $2)`,
+		`delete from moderation_dlq_outbox where id in (select id from moderation_dlq_outbox where coalesce(published_at, created_at) < $1 order by created_at limit $2)`,
+		`delete from moderation_task_outbox where id in (select id from moderation_task_outbox where coalesce(published_at, created_at) < $1 order by created_at limit $2)`,
+		`delete from moderation_idempotency_keys where id in (select id from moderation_idempotency_keys where created_at < $1 order by created_at limit $2)`,
+		`delete from moderation_tasks where id in (select id from moderation_tasks where terminal_at < $1 order by terminal_at limit $2)`,
+		`delete from moderation_batches where id in (select id from moderation_batches where terminal_at < $1 and not exists (select 1 from moderation_tasks where batch_id = moderation_batches.id) order by terminal_at limit $2)`,
+	}
+	total := 0
+	for _, statement := range statements {
+		var res sql.Result
+		res, err = tx.ExecContext(ctx, statement, cutoff, limit)
+		if err != nil {
+			return 0, err
+		}
+		count, countErr := res.RowsAffected()
+		if countErr != nil {
+			return 0, countErr
+		}
+		total += int(count)
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func (s *PostgresStore) requireWebhookEndpointTx(ctx context.Context, tx *sql.Tx, callerID, destinationURL string) error {
@@ -644,6 +721,67 @@ join moderation_webhook_endpoints e on e.caller_id = u.caller_id and e.destinati
 where u.terminal_at is not null and u.webhook_url is not null
 on conflict (resource_type, resource_id) do nothing`, batchID)
 	return err
+}
+
+func (s *PostgresStore) loadTaskTx(ctx context.Context, tx *sql.Tx, taskID string) (Task, error) {
+	row := tx.QueryRowContext(ctx, `
+select id, caller_id, coalesce(batch_id::text, ''), client_item_id, content_type, policy, status,
+       coalesce(text_content, ''), coalesce(image_url, ''), attempts, correlation_id, coalesce(webhook_url, ''), created_at, updated_at
+from moderation_tasks
+where id = $1`, taskID)
+	var task Task
+	var textValue, imageURL string
+	if err := row.Scan(&task.ID, &task.CallerID, &task.BatchID, &task.ClientItemID, &task.ContentType, &task.Policy, &task.Status, &textValue, &imageURL, &task.Attempts, &task.CorrelationID, &task.WebhookURL, &task.CreatedAt, &task.UpdatedAt); err != nil {
+		return Task{}, err
+	}
+	if textValue != "" {
+		task.Text = &textValue
+	}
+	if imageURL != "" {
+		task.ImageURL = &imageURL
+	}
+	return task, nil
+}
+
+func (s *PostgresStore) loadBatchTx(ctx context.Context, tx *sql.Tx, batchID string) (Batch, []Task, error) {
+	row := tx.QueryRowContext(ctx, `
+select id, caller_id, status, total_count, queued_count, processing_count, succeeded_count, failed_count, coalesce(webhook_url, ''), created_at, updated_at
+from moderation_batches
+where id = $1`, batchID)
+	var batch Batch
+	if err := row.Scan(&batch.ID, &batch.CallerID, &batch.Status, &batch.Total, &batch.Queued, &batch.Processing, &batch.Succeeded, &batch.Failed, &batch.WebhookURL, &batch.CreatedAt, &batch.UpdatedAt); err != nil {
+		return Batch{}, nil, err
+	}
+	rows, err := tx.QueryContext(ctx, `
+select t.id, t.caller_id, coalesce(t.batch_id::text, ''), t.client_item_id, t.content_type, t.policy, t.status,
+       coalesce(t.text_content, ''), coalesce(t.image_url, ''), t.attempts, t.correlation_id, coalesce(t.webhook_url, ''), t.created_at, t.updated_at
+from moderation_batch_tasks bt
+join moderation_tasks t on t.id = bt.task_id
+where bt.batch_id = $1
+order by bt.position`, batchID)
+	if err != nil {
+		return Batch{}, nil, err
+	}
+	defer rows.Close()
+	var tasks []Task
+	for rows.Next() {
+		var task Task
+		var textValue, imageURL string
+		if err := rows.Scan(&task.ID, &task.CallerID, &task.BatchID, &task.ClientItemID, &task.ContentType, &task.Policy, &task.Status, &textValue, &imageURL, &task.Attempts, &task.CorrelationID, &task.WebhookURL, &task.CreatedAt, &task.UpdatedAt); err != nil {
+			return Batch{}, nil, err
+		}
+		if textValue != "" {
+			task.Text = &textValue
+		}
+		if imageURL != "" {
+			task.ImageURL = &imageURL
+		}
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return Batch{}, nil, err
+	}
+	return batch, tasks, nil
 }
 
 func rollbackUnlessDone(tx *sql.Tx, err *error) {

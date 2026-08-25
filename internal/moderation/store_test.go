@@ -74,6 +74,7 @@ func TestPostgresMigrationsCoverModerationDurabilityWithoutMutatingLegacyTables(
 		"create unique index if not exists idx_moderation_webhook_terminal_resource",
 		"body_bytes bytea not null",
 		"event_body bytea not null",
+		"claim_token text",
 		"claimed_until timestamptz",
 		"for update skip locked",
 	} {

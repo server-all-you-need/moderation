@@ -14,6 +14,7 @@ type Clock interface {
 type WorkerStore interface {
 	Clock
 	ClaimTaskForProcessing(ctx context.Context, taskID string, lockFor time.Duration) (Task, bool, error)
+	BeginProviderAttempt(ctx context.Context, taskID string) (Task, error)
 	CompleteTask(ctx context.Context, taskID string, result auditplatform.ModerationResult) error
 	ScheduleTaskRetry(ctx context.Context, taskID string, delay time.Duration, message string) error
 	FailTaskWithDLQ(ctx context.Context, taskID string, taskErr TaskError, reason string) error
@@ -38,7 +39,7 @@ type DLQOutboxStore interface {
 type WebhookStore interface {
 	Clock
 	ClaimDueWebhooks(ctx context.Context, limit int, lockFor time.Duration) []WebhookOutboxRow
-	RecordWebhookAttempt(id string, statusCode int, attemptErr error)
+	RecordWebhookAttempt(ctx context.Context, id, claimToken string, statusCode int, attemptErr error) bool
 }
 
 type SecretResolver interface {
