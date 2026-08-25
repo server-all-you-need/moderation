@@ -113,6 +113,39 @@ func TestTaskConsumerGroupPoisonDLQDoesNotForwardUntrustedKafkaKey(t *testing.T)
 	if !session.marked {
 		t.Fatalf("poison message must be marked consumed")
 	}
+	if session.commits != 1 {
+		t.Fatalf("poison message commits = %d, want 1", session.commits)
+	}
+}
+
+func TestTaskConsumerGroupCommitsSuccessfulMessageWhenAutoCommitIsDisabled(t *testing.T) {
+	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
+	task, _, err := store.CreateTask(context.Background(), CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "commit-success",
+		PayloadHash:    "sha256:commit-success",
+		Input:          textInput("post-commit", "hello"),
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	handler := NewTaskConsumerGroupHandler(NewTaskConsumer(NewWorkerWithOptions(WorkerOptions{
+		Store:          store,
+		Provider:       &countingProvider{},
+		ProviderBudget: allowAllProviderBudget{},
+	})))
+	messages := make(chan *sarama.ConsumerMessage, 1)
+	messages <- &sarama.ConsumerMessage{Topic: TopicModerationTasksV1, Value: mustTaskEventBytes(t, TaskEventFromTask(task))}
+	close(messages)
+	session := &fakeConsumerGroupSession{ctx: context.Background()}
+
+	if err := handler.ConsumeClaim(session, fakeConsumerGroupClaim{messages: messages}); err != nil {
+		t.Fatalf("ConsumeClaim: %v", err)
+	}
+	if !session.marked || session.commits != 1 {
+		t.Fatalf("successful message marked=%v commits=%d, want true/1", session.marked, session.commits)
+	}
 }
 
 func TestTaskConsumerGroupIgnoresDuplicateTerminalEvents(t *testing.T) {
@@ -176,8 +209,9 @@ func (p *recordingPublisher) Publish(_ context.Context, topic, key string, value
 }
 
 type fakeConsumerGroupSession struct {
-	ctx    context.Context
-	marked bool
+	ctx     context.Context
+	marked  bool
+	commits int
 }
 
 func (s *fakeConsumerGroupSession) Claims() map[string][]int32 { return nil }
@@ -185,7 +219,7 @@ func (s *fakeConsumerGroupSession) MemberID() string           { return "member"
 func (s *fakeConsumerGroupSession) GenerationID() int32        { return 1 }
 func (s *fakeConsumerGroupSession) MarkOffset(string, int32, int64, string) {
 }
-func (s *fakeConsumerGroupSession) Commit() {}
+func (s *fakeConsumerGroupSession) Commit() { s.commits++ }
 func (s *fakeConsumerGroupSession) ResetOffset(string, int32, int64, string) {
 }
 func (s *fakeConsumerGroupSession) MarkMessage(*sarama.ConsumerMessage, string) {

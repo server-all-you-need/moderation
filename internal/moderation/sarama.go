@@ -106,11 +106,13 @@ func (h *TaskConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSess
 						}
 					}
 					session.MarkMessage(message, "invalid_task_event")
+					session.Commit()
 					continue
 				}
 				return err
 			}
 			session.MarkMessage(message, "")
+			session.Commit()
 		}
 	}
 }
