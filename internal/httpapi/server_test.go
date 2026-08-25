@@ -354,6 +354,51 @@ func TestBatchCursorPaginationInternalStatsReadinessAndOpenAPI(t *testing.T) {
 	}
 }
 
+func TestInternalModerationResponsesIncludeCallerIDButPublicResponsesDoNot(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+	taskBody := `{"client_item_id":"post-1","content_type":"text","policy":"text.general","text":"one"}`
+	task := doJSON(server, http.MethodPost, "/api/v1/moderation-tasks", "test-token", map[string]string{"Idempotency-Key": "caller-task"}, taskBody)
+	if task.Code != http.StatusAccepted {
+		t.Fatalf("task submit = %d %s", task.Code, task.Body.String())
+	}
+	var taskAccepted map[string]interface{}
+	_ = json.Unmarshal(task.Body.Bytes(), &taskAccepted)
+	taskID := taskAccepted["task_id"].(string)
+
+	batchBody := `{"items":[{"client_item_id":"post-2","content_type":"text","policy":"text.general","text":"two"}]}`
+	batch := doJSON(server, http.MethodPost, "/api/v1/moderation-batches", "test-token", map[string]string{"Idempotency-Key": "caller-batch"}, batchBody)
+	if batch.Code != http.StatusAccepted {
+		t.Fatalf("batch submit = %d %s", batch.Code, batch.Body.String())
+	}
+	var batchAccepted map[string]interface{}
+	_ = json.Unmarshal(batch.Body.Bytes(), &batchAccepted)
+	batchID := batchAccepted["batch_id"].(string)
+
+	for _, path := range []string{
+		"/internal/v1/moderation/tasks",
+		"/internal/v1/moderation/tasks/" + taskID,
+		"/internal/v1/moderation/batches",
+		"/internal/v1/moderation/batches/" + batchID,
+		"/internal/v1/moderation/batches/" + batchID + "/items",
+	} {
+		got := doJSON(server, http.MethodGet, path, "admin-token", nil, "")
+		if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), `"caller_id":"client-a"`) {
+			t.Fatalf("%s = %d %s, want internal caller_id", path, got.Code, got.Body.String())
+		}
+	}
+
+	for _, path := range []string{
+		"/api/v1/moderation-tasks/" + taskID,
+		"/api/v1/moderation-batches/" + batchID,
+		"/api/v1/moderation-batches/" + batchID + "/items",
+	} {
+		got := doJSON(server, http.MethodGet, path, "test-token", nil, "")
+		if got.Code != http.StatusOK || strings.Contains(got.Body.String(), `"caller_id"`) {
+			t.Fatalf("%s = %d %s, want public response without caller_id", path, got.Code, got.Body.String())
+		}
+	}
+}
+
 func largestValidBatchJSON(count, runesPerItem int) string {
 	text := strings.Repeat("😀", runesPerItem)
 	items := make([]string, 0, count)

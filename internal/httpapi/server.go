@@ -402,7 +402,7 @@ func (s *Server) handleAdminTasks(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": tasksDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
 func (s *Server) handleAdminTask(w http.ResponseWriter, r *http.Request) {
@@ -418,7 +418,7 @@ func (s *Server) handleAdminTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, taskDTO(task))
+	writeJSON(w, http.StatusOK, internalTaskDTO(task))
 }
 
 func (s *Server) handleAdminBatches(w http.ResponseWriter, r *http.Request) {
@@ -435,7 +435,7 @@ func (s *Server) handleAdminBatches(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": batchesDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalBatchesDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
 func (s *Server) handleAdminBatch(w http.ResponseWriter, r *http.Request) {
@@ -451,7 +451,7 @@ func (s *Server) handleAdminBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, batchDTO(batch))
+	writeJSON(w, http.StatusOK, internalBatchDTO(batch))
 }
 
 func (s *Server) handleAdminBatchItems(w http.ResponseWriter, r *http.Request) {
@@ -468,7 +468,7 @@ func (s *Server) handleAdminBatchItems(w http.ResponseWriter, r *http.Request) {
 		writeStoreError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": tasksDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
 func (s *Server) requirePublic(w http.ResponseWriter, r *http.Request, scope string) (ClientConfig, bool) {
@@ -660,6 +660,11 @@ type taskResponse struct {
 	TerminalAt        *time.Time                 `json:"terminal_at,omitempty"`
 }
 
+type internalTaskResponse struct {
+	CallerID string `json:"caller_id"`
+	taskResponse
+}
+
 func taskAcceptedDTO(task moderation.Task) map[string]interface{} {
 	return map[string]interface{}{
 		"task_id": task.ID,
@@ -692,6 +697,10 @@ func taskDTO(task moderation.Task) taskResponse {
 	return out
 }
 
+func internalTaskDTO(task moderation.Task) internalTaskResponse {
+	return internalTaskResponse{CallerID: task.CallerID, taskResponse: taskDTO(task)}
+}
+
 func taskResultDTO(result auditplatform.ModerationResult) map[string]interface{} {
 	return map[string]interface{}{
 		"client_item_id":      result.ClientItemID,
@@ -712,6 +721,14 @@ func tasksDTO(tasks []moderation.Task) []taskResponse {
 	return out
 }
 
+func internalTasksDTO(tasks []moderation.Task) []internalTaskResponse {
+	out := make([]internalTaskResponse, 0, len(tasks))
+	for _, task := range tasks {
+		out = append(out, internalTaskDTO(task))
+	}
+	return out
+}
+
 type batchResponse struct {
 	BatchID    string                 `json:"batch_id"`
 	Status     moderation.BatchStatus `json:"status"`
@@ -723,6 +740,11 @@ type batchResponse struct {
 	CreatedAt  time.Time              `json:"created_at"`
 	UpdatedAt  time.Time              `json:"updated_at"`
 	TerminalAt *time.Time             `json:"terminal_at,omitempty"`
+}
+
+type internalBatchResponse struct {
+	CallerID string `json:"caller_id"`
+	batchResponse
 }
 
 func batchDTO(batch moderation.Batch) batchResponse {
@@ -740,10 +762,22 @@ func batchDTO(batch moderation.Batch) batchResponse {
 	}
 }
 
+func internalBatchDTO(batch moderation.Batch) internalBatchResponse {
+	return internalBatchResponse{CallerID: batch.CallerID, batchResponse: batchDTO(batch)}
+}
+
 func batchesDTO(batches []moderation.Batch) []batchResponse {
 	out := make([]batchResponse, 0, len(batches))
 	for _, batch := range batches {
 		out = append(out, batchDTO(batch))
+	}
+	return out
+}
+
+func internalBatchesDTO(batches []moderation.Batch) []internalBatchResponse {
+	out := make([]internalBatchResponse, 0, len(batches))
+	for _, batch := range batches {
+		out = append(out, internalBatchDTO(batch))
 	}
 	return out
 }
