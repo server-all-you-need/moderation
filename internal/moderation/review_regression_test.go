@@ -281,6 +281,7 @@ func TestPostgresCreateTaskTransactionCommitsTaskIdempotencyAndOutbox(t *testing
 	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
 
 	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a10:async_task6:idem-1")
 	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery("select 1 from moderation_webhook_endpoints").WillReturnRows(sqlmockRows("exists").AddRow(1))
 	mock.ExpectExec("insert into moderation_tasks").WillReturnResult(sqlmockResult(1, 1))
@@ -310,6 +311,7 @@ func TestPostgresCreateTaskConflictRollsBack(t *testing.T) {
 	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
 
 	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a10:async_task6:idem-1")
 	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").WillReturnRows(sqlmockRows("payload_hash", "resource_type", "resource_id").AddRow("sha256:old", "task", "task-1"))
 	mock.ExpectRollback()
 
@@ -355,6 +357,7 @@ func TestPostgresIdempotencyReplayReturnsFullTaskAndRejectsWrongResourceType(t *
 	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
 
 	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a10:async_task6:idem-1")
 	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").
 		WillReturnRows(sqlmockRows("payload_hash", "resource_type", "resource_id").AddRow("sha256:payload", "batch", "batch-1"))
 	mock.ExpectRollback()
@@ -370,6 +373,7 @@ func TestPostgresIdempotencyReplayReturnsFullTaskAndRejectsWrongResourceType(t *
 	}
 
 	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a10:async_task6:idem-1")
 	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").
 		WillReturnRows(sqlmockRows("payload_hash", "resource_type", "resource_id").AddRow("sha256:payload", "task", "task-1"))
 	mock.ExpectQuery("select id, caller_id, coalesce\\(batch_id::text, ''\\), client_item_id, content_type, policy").
@@ -397,6 +401,7 @@ func TestPostgresBatchReplayReturnsBatchWithOrderedMembers(t *testing.T) {
 	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
 
 	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a5:batch7:batch-1")
 	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").
 		WillReturnRows(sqlmockRows("payload_hash", "resource_type", "resource_id").AddRow("sha256:batch", "batch", "batch-1"))
 	mock.ExpectQuery("select id, caller_id, status, total_count, queued_count, processing_count, succeeded_count, failed_count").
@@ -619,4 +624,64 @@ func TestPostgresWebhookDispatcherRequiresExplicitSecretResolver(t *testing.T) {
 		}
 	}()
 	_ = NewWebhookDispatcher(store, &fakeWebhookHTTP{status: 200})
+}
+
+func TestPostgresCreateTaskLocksIdempotencyScopeBeforeExistenceCheck(t *testing.T) {
+	db, mock, cleanup := newSQLMock(t)
+	defer cleanup()
+	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
+
+	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a10:async_task6:idem-1")
+	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec("insert into moderation_tasks").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_task_outbox").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_idempotency_keys").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectCommit()
+
+	_, replayed, err := store.CreateTask(context.Background(), CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "idem-1",
+		PayloadHash:    "sha256:payload",
+		Input:          textInput("post-1", "hello"),
+	})
+	if err != nil || replayed {
+		t.Fatalf("create task: replayed=%v err=%v", replayed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresCreateBatchLocksIdempotencyScopeBeforeExistenceCheck(t *testing.T) {
+	db, mock, cleanup := newSQLMock(t)
+	defer cleanup()
+	store := NewPostgresStore(db, func() time.Time { return time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC) })
+
+	mock.ExpectBegin()
+	expectIdempotencyScopeLock(mock, "8:client-a5:batch7:batch-1")
+	mock.ExpectQuery("select payload_hash, resource_type, resource_id from moderation_idempotency_keys").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectExec("insert into moderation_batches").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_tasks").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_batch_tasks").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_task_outbox").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectExec("insert into moderation_idempotency_keys").WillReturnResult(sqlmockResult(1, 1))
+	mock.ExpectCommit()
+
+	_, _, replayed, err := store.CreateBatch(context.Background(), CreateBatchRequest{
+		CallerID:       "client-a",
+		Operation:      "batch",
+		IdempotencyKey: "batch-1",
+		PayloadHash:    "sha256:batch",
+		Inputs:         []auditplatform.ModerationInput{textInput("post-1", "hello")},
+	})
+	if err != nil || replayed {
+		t.Fatalf("create batch: replayed=%v err=%v", replayed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
 }

@@ -23,3 +23,9 @@ func sqlmockRows(columns ...string) *sqlmock.Rows {
 func sqlmockResult(lastInsertID, rowsAffected int64) sql.Result {
 	return sqlmock.NewResult(lastInsertID, rowsAffected)
 }
+
+func expectIdempotencyScopeLock(mock sqlmock.Sqlmock, scope string) {
+	mock.ExpectExec("select pg_advisory_xact_lock\\(hashtextextended\\(\\$1, 0\\)\\)").
+		WithArgs(scope).
+		WillReturnResult(sqlmockResult(0, 1))
+}

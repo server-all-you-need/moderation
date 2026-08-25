@@ -64,6 +64,9 @@ func (s *PostgresStore) CreateTask(ctx context.Context, req CreateTaskRequest) (
 }
 
 func (s *PostgresStore) createTaskTx(ctx context.Context, tx *sql.Tx, req CreateTaskRequest) (Task, bool, error) {
+	if err := lockIdempotencyScope(ctx, tx, req.CallerID, req.Operation, req.IdempotencyKey); err != nil {
+		return Task{}, false, err
+	}
 	var payloadHash, resourceType, resourceID string
 	err := tx.QueryRowContext(ctx, `
 select payload_hash, resource_type, resource_id
@@ -151,6 +154,9 @@ func (s *PostgresStore) CreateBatch(ctx context.Context, req CreateBatchRequest)
 	}
 	defer rollbackUnlessDone(tx, &err)
 
+	if err = lockIdempotencyScope(ctx, tx, req.CallerID, req.Operation, req.IdempotencyKey); err != nil {
+		return Batch{}, nil, false, err
+	}
 	var payloadHash, resourceType, resourceID string
 	err = tx.QueryRowContext(ctx, `
 select payload_hash, resource_type, resource_id
@@ -816,4 +822,13 @@ func deliveredAtFor(statusCode int, err error, now time.Time) sql.NullTime {
 		return sql.NullTime{Time: now, Valid: true}
 	}
 	return sql.NullTime{}
+}
+
+func lockIdempotencyScope(ctx context.Context, tx *sql.Tx, callerID, operation, idempotencyKey string) error {
+	_, err := tx.ExecContext(ctx, `select pg_advisory_xact_lock(hashtextextended($1, 0))`, idempotencyLockScope(callerID, operation, idempotencyKey))
+	return err
+}
+
+func idempotencyLockScope(callerID, operation, idempotencyKey string) string {
+	return fmt.Sprintf("%d:%s%d:%s%d:%s", len(callerID), callerID, len(operation), operation, len(idempotencyKey), idempotencyKey)
 }
