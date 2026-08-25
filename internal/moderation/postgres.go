@@ -260,7 +260,6 @@ for update skip locked`, limit)
 	if err != nil {
 		return nil
 	}
-	defer rows.Close()
 	var claimed []TaskOutboxRow
 	for rows.Next() {
 		var row TaskOutboxRow
@@ -271,15 +270,20 @@ for update skip locked`, limit)
 		if batchID.Valid {
 			row.BatchID = batchID.String
 		}
-		claimedUntil := s.now().Add(lockFor)
-		if _, err := tx.ExecContext(ctx, `update moderation_task_outbox set claimed_until = $1, attempts = attempts + 1, updated_at = $2 where id = $3 and published_at is null`, claimedUntil, s.now(), row.ID); err != nil {
-			return nil
-		}
-		row.ClaimedUntil = &claimedUntil
 		claimed = append(claimed, row)
 	}
 	if err := rows.Err(); err != nil {
 		return nil
+	}
+	if err := rows.Close(); err != nil {
+		return nil
+	}
+	for i := range claimed {
+		claimedUntil := s.now().Add(lockFor)
+		if _, err := tx.ExecContext(ctx, `update moderation_task_outbox set claimed_until = $1, attempts = attempts + 1, updated_at = $2 where id = $3 and published_at is null`, claimedUntil, s.now(), claimed[i].ID); err != nil {
+			return nil
+		}
+		claimed[i].ClaimedUntil = &claimedUntil
 	}
 	if err := tx.Commit(); err != nil {
 		return nil

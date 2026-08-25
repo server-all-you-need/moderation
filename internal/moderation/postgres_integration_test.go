@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +15,72 @@ import (
 	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 	_ "github.com/lib/pq"
 )
+
+func TestPostgresLiveClaimTaskOutbox(t *testing.T) {
+	dsn := os.Getenv("POST_AUDIT_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("POST_AUDIT_TEST_POSTGRES_DSN is not set")
+	}
+
+	schema := fmt.Sprintf("moderation_outbox_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	defer adminDB.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := adminDB.ExecContext(ctx, `create schema `+schema); err != nil {
+		t.Fatalf("create isolated schema: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = adminDB.ExecContext(context.Background(), `drop schema `+schema+` cascade`)
+	})
+
+	isolatedDSN := postgresDSNWithSearchPath(t, dsn, schema)
+	db, err := sql.Open("postgres", isolatedDSN)
+	if err != nil {
+		t.Fatalf("open isolated postgres: %v", err)
+	}
+	defer db.Close()
+	store := NewPostgresStore(db, time.Now)
+	if err := store.ApplyMigrations(ctx); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into moderation_api_clients (id, name, key_hash) values ('outbox-client','Outbox Test','outbox-test-hash')`); err != nil {
+		t.Fatalf("insert client: %v", err)
+	}
+	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
+		CallerID:       "outbox-client",
+		Operation:      "async_task",
+		IdempotencyKey: "outbox-key",
+		PayloadHash:    "sha256:outbox",
+		Input:          textInput("outbox-item", "hello"),
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	rows := store.ClaimTaskOutbox(ctx, 1, 30*time.Second)
+	if len(rows) != 1 || rows[0].TaskID != task.ID || rows[0].ClaimedUntil == nil {
+		t.Fatalf("ClaimTaskOutbox() = %#v, want claimed row for task %s", rows, task.ID)
+	}
+}
+
+func postgresDSNWithSearchPath(t *testing.T, dsn, schema string) string {
+	t.Helper()
+	if strings.Contains(dsn, "://") {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("parse postgres DSN: %v", err)
+		}
+		query := parsed.Query()
+		query.Set("search_path", schema)
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
+	}
+	return dsn + " search_path=" + schema
+}
 
 func TestPostgresLiveMigrationsApply(t *testing.T) {
 	dsn := os.Getenv("POST_AUDIT_TEST_POSTGRES_DSN")
