@@ -1,71 +1,259 @@
 package auditplatform
 
-// TaskData 代表一个通用的内容审核任务单元。
-// 它包含了执行审核所需的最基本信息。
-type TaskData struct {
-	// ID 是此审核任务的唯一标识符，通常对应您系统中的原始内容ID（例如帖子ID）。
-	ID string `json:"id"`
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/url"
+	"strings"
+	"unicode/utf8"
+)
 
-	// Content 是需要审核的文本内容。
-	// 它可以是帖子标题、正文的组合，或其他需要审核的文本片段。
-	Content string `json:"content"`
+type ContentType string
 
-	// ContentType 指示内容类型，例如 "text", "image_url", "audio_url"。
-	// 初期我们主要关注文本，但设计上可以预留扩展性。
-	// 对于纯文本审核，此字段可以暂时不强制使用或默认为 "text"。
-	ContentType string `json:"contentType,omitempty"`
+const (
+	ContentTypeText  ContentType = "text"
+	ContentTypeImage ContentType = "image"
+)
 
-	// UserID 是内容发布者的用户ID (可选)。
-	// 某些审核平台可能会利用用户信息进行更精准的判断。
-	UserID string `json:"userId,omitempty"`
+type Decision string
 
-	// CallbackURL 是一个可选字段，用于指定审核完成后接收异步通知的URL。
-	// 对于同步API调用模式，此字段可能不被使用。
-	CallbackURL string `json:"callbackUrl,omitempty"`
+const (
+	DecisionPass   Decision = "pass"
+	DecisionReview Decision = "review"
+	DecisionBlock  Decision = "block"
+)
 
-	// Extra 是一个可选字段，用于传递一些额外的、审核平台可能需要的自定义参数。
-	// 使用 map[string]interface{} 可以提供灵活性。
-	Extra map[string]interface{} `json:"extra,omitempty"`
+type RiskLevel string
+
+const (
+	RiskLevelNone   RiskLevel = "none"
+	RiskLevelLow    RiskLevel = "low"
+	RiskLevelMedium RiskLevel = "medium"
+	RiskLevelHigh   RiskLevel = "high"
+)
+
+type Policy string
+
+const (
+	PolicyTextComment  Policy = "text.comment"
+	PolicyTextNickname Policy = "text.nickname"
+	PolicyTextGeneral  Policy = "text.general"
+	PolicyImageComment Policy = "image.comment"
+	PolicyImageAvatar  Policy = "image.avatar"
+	PolicyImageGeneral Policy = "image.general"
+)
+
+type PolicySpec struct {
+	ContentType       ContentType
+	ProviderService   string
+	MaxTextCodePoints int
 }
 
-// RejectionDetail 封装了内容审核未通过时，具体的风险或拒绝原因。
+var policySpecs = map[Policy]PolicySpec{
+	PolicyTextComment:  {ContentType: ContentTypeText, ProviderService: "comment_detection_pro", MaxTextCodePoints: 600},
+	PolicyTextNickname: {ContentType: ContentTypeText, ProviderService: "nickname_detection_pro", MaxTextCodePoints: 600},
+	PolicyTextGeneral:  {ContentType: ContentTypeText, ProviderService: "ugc_moderation_byllm", MaxTextCodePoints: 2000},
+	PolicyImageComment: {ContentType: ContentTypeImage, ProviderService: "postImageCheck"},
+	PolicyImageAvatar:  {ContentType: ContentTypeImage, ProviderService: "profilePhotoCheck"},
+	PolicyImageGeneral: {ContentType: ContentTypeImage, ProviderService: "baselineCheck_pro"},
+}
+
+func LookupPolicy(policy Policy) (PolicySpec, bool) {
+	spec, ok := policySpecs[policy]
+	return spec, ok
+}
+
+type ModerationInput struct {
+	ClientItemID string      `json:"client_item_id"`
+	ContentType  ContentType `json:"content_type"`
+	Policy       Policy      `json:"policy"`
+	Text         string      `json:"text,omitempty"`
+	ImageURL     string      `json:"image_url,omitempty"`
+}
+
+func (in ModerationInput) Validate() error {
+	if err := validateClientItemID(in.ClientItemID); err != nil {
+		return err
+	}
+	spec, ok := LookupPolicy(in.Policy)
+	if !ok {
+		return fmt.Errorf("unknown policy %q", in.Policy)
+	}
+	if in.ContentType != ContentTypeText && in.ContentType != ContentTypeImage {
+		return fmt.Errorf("unsupported content_type %q", in.ContentType)
+	}
+	if spec.ContentType != in.ContentType {
+		return fmt.Errorf("policy %q does not match content_type %q", in.Policy, in.ContentType)
+	}
+
+	hasText := in.Text != ""
+	hasImageURL := in.ImageURL != ""
+	if hasText == hasImageURL {
+		return fmt.Errorf("exactly one of text or image_url is required")
+	}
+
+	switch in.ContentType {
+	case ContentTypeText:
+		if !hasText {
+			return fmt.Errorf("text content requires text")
+		}
+		if utf8.RuneCountInString(in.Text) > spec.MaxTextCodePoints {
+			return fmt.Errorf("text exceeds %d Unicode code points", spec.MaxTextCodePoints)
+		}
+	case ContentTypeImage:
+		if !hasImageURL {
+			return fmt.Errorf("image content requires image_url")
+		}
+		if err := ValidatePublicHTTPSImageURL(in.ImageURL); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ValidatePublicHTTPSImageURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid image_url: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("image_url must use https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("image_url must not contain userinfo")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("image_url must have a hostname")
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return fmt.Errorf("image_url must not use non-443 explicit port")
+	}
+	normalizedHost := strings.ToLower(strings.TrimSuffix(host, "."))
+	if ip := net.ParseIP(normalizedHost); ip != nil {
+		return fmt.Errorf("image_url hostname must not be an IP literal")
+	}
+	if normalizedHost == "localhost" || strings.HasSuffix(normalizedHost, ".local") || strings.HasSuffix(normalizedHost, ".internal") {
+		return fmt.Errorf("image_url hostname must be public")
+	}
+	if strings.Contains(normalizedHost, "_") {
+		return fmt.Errorf("image_url must have a DNS hostname")
+	}
+	return nil
+}
+
+func validateClientItemID(id string) error {
+	if id == "" || len(id) > 64 {
+		return fmt.Errorf("client_item_id must be 1-64 characters")
+	}
+	for _, r := range id {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("client_item_id contains invalid character")
+	}
+	return nil
+}
+
+type LabelEntry struct {
+	Label       string   `json:"label"`
+	Confidence  float64  `json:"confidence,omitempty"`
+	Description string   `json:"description,omitempty"`
+	RiskWords   []string `json:"risk_words,omitempty"`
+}
+
+type ModerationResult struct {
+	ClientItemID      string       `json:"client_item_id"`
+	Decision          Decision     `json:"decision"`
+	RiskLevel         RiskLevel    `json:"risk_level"`
+	ProviderName      string       `json:"provider_name"`
+	ProviderRequestID string       `json:"provider_request_id,omitempty"`
+	ProviderDataID    string       `json:"provider_data_id,omitempty"`
+	Labels            []LabelEntry `json:"labels,omitempty"`
+}
+
+type Provider interface {
+	Moderate(ctx context.Context, input ModerationInput) (ModerationResult, error)
+	Name() string
+}
+
+const (
+	ErrorCodeInvalidInput      = "invalid_input"
+	ErrorCodeProviderResponse  = "provider_response"
+	ErrorCodeAuthentication    = "authentication"
+	ErrorCodePermission        = "permission"
+	ErrorCodeInvalidRequest    = "invalid_request"
+	ErrorCodeTimeout           = "timeout"
+	ErrorCodeNetwork           = "network"
+	ErrorCodeThrottled         = "throttled"
+	ErrorCodeProviderTemporary = "provider_temporary"
+)
+
+type ProviderError struct {
+	Code      string
+	Retryable bool
+	Message   string
+	Err       error
+}
+
+func (e *ProviderError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return e.Code
+}
+
+func (e *ProviderError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func NormalizeRiskLevel(raw string) (RiskLevel, Decision, error) {
+	switch RiskLevel(strings.ToLower(strings.TrimSpace(raw))) {
+	case RiskLevelNone:
+		return RiskLevelNone, DecisionPass, nil
+	case RiskLevelLow:
+		return RiskLevelLow, DecisionPass, nil
+	case RiskLevelMedium:
+		return RiskLevelMedium, DecisionReview, nil
+	case RiskLevelHigh:
+		return RiskLevelHigh, DecisionBlock, nil
+	default:
+		return "", "", &ProviderError{Code: ErrorCodeProviderResponse, Message: "unknown or missing provider risk level"}
+	}
+}
+
+// TaskData keeps the pre-V2 text batch call surface compiling while Kafka is
+// migrated in a later task.
+type TaskData struct {
+	ID          string                 `json:"id"`
+	Content     string                 `json:"content"`
+	ContentType string                 `json:"contentType,omitempty"`
+	UserID      string                 `json:"userId,omitempty"`
+	CallbackURL string                 `json:"callbackUrl,omitempty"`
+	Extra       map[string]interface{} `json:"extra,omitempty"`
+}
+
 type RejectionDetail struct {
-	// Label 是审核命名的主要风险类别或标签。
-	// 例如："spam", "porn", "ad", "abuse"。
-	// 这对应阿里云返回结果中顶层的 "Label"。
-	Label string `json:"label"`
-
-	// Suggestion 是针对此具体风险标签的建议 (通常来源于审核平台的直接建议)。
-	Suggestion string `json:"suggestion,omitempty"`
-
-	// Score 是此风险标签的置信度得分 (通常在 0.0 到 100.0 之间)。
-	Score float64 `json:"score,omitempty"`
-
-	// MatchedContent 是文本中实际命中风险规则的具体内容片段或关键词。
-	// 这通常从审核平台返回的更细致的详情中提取 (例如阿里云的 Results[].Details[].Contexts)。
+	Label          string   `json:"label"`
+	Suggestion     string   `json:"suggestion,omitempty"`
+	Score          float64  `json:"score,omitempty"`
 	MatchedContent []string `json:"matchedContent,omitempty"`
 }
 
-// ReviewResult 代表单个审核任务的处理结果。
 type ReviewResult struct {
-	// OriginalTaskID 对应提交审核时 TaskData 中的 ID。
-	OriginalTaskID string `json:"originalTaskId"`
-
-	// ProviderTaskID 是审核平台为此任务生成的唯一ID (可选, 用于追踪)。
-	ProviderTaskID string `json:"providerTaskId,omitempty"`
-
-	// Suggestion 是审核平台对该内容的总体建议。
-	// 常见值:
-	// - "pass": 内容审核通过，无风险或风险可接受。
-	// - "review": 内容存在潜在风险，建议人工复审。
-	// - "block": 内容存在明确风险，建议直接拒绝或屏蔽。
-	Suggestion string `json:"suggestion"`
-
-	// Details 包含了审核未通过或需要复审时的具体风险详情。
-	// 如果 Suggestion 是 "pass"，此列表通常为空。
-	Details []RejectionDetail `json:"details,omitempty"`
-
-	// Error 记录了在处理此单个审核任务时发生的错误。
-	// 注意：这个字段通常不在JSON序列化中，主要用于程序内部错误传递。
-	Error error `json:"-"`
+	OriginalTaskID string            `json:"originalTaskId"`
+	ProviderTaskID string            `json:"providerTaskId,omitempty"`
+	Suggestion     string            `json:"suggestion"`
+	Details        []RejectionDetail `json:"details,omitempty"`
+	Error          error             `json:"-"`
 }
