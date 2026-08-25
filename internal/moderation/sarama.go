@@ -101,7 +101,7 @@ func (h *TaskConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSess
 						if marshalErr != nil {
 							return marshalErr
 						}
-						if publishErr := h.poisonPublisher.Publish(session.Context(), TopicModerationTaskDLQ, string(message.Key), value); publishErr != nil {
+						if publishErr := h.poisonPublisher.Publish(session.Context(), TopicModerationTaskDLQ, "invalid_task_event", value); publishErr != nil {
 							return publishErr
 						}
 					}

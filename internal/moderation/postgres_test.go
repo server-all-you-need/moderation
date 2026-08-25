@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 )
 
 func newSQLMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock, func()) {
@@ -37,6 +39,35 @@ func TestPostgresAdminStatsReturnsOutboxCountErrors(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestBatchFilterSQLCombinesTaskLevelPredicatesInOneMemberExists(t *testing.T) {
+	where, args := batchFilterSQL(ListFilter{
+		CallerID:    "client-a",
+		BatchStatus: BatchStatusProcessing,
+		ContentType: auditplatform.ContentTypeImage,
+		TaskStatus:  TaskStatusSucceeded,
+		Policy:      auditplatform.PolicyImageGeneral,
+		RiskLevel:   auditplatform.RiskLevelHigh,
+	})
+	if strings.Count(where, "exists (select 1 from moderation_tasks t") != 1 {
+		t.Fatalf("task-level predicates must share one correlated exists, got %s", where)
+	}
+	for _, clause := range []string{
+		"caller_id = $1",
+		"status = $2",
+		"t.content_type = $3",
+		"t.status = $4",
+		"t.policy = $5",
+		"t.result_json->>'risk_level' = $6",
+	} {
+		if !strings.Contains(where, clause) {
+			t.Fatalf("where missing %q: %s", clause, where)
+		}
+	}
+	if len(args) != 6 {
+		t.Fatalf("args len = %d, want 6: %#v", len(args), args)
 	}
 }
 

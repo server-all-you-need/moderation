@@ -104,6 +104,15 @@ func TestWorkerRequiresExplicitProviderBudget(t *testing.T) {
 	_ = NewWorkerWithOptions(WorkerOptions{Store: NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)), Provider: &fakeProvider{}})
 }
 
+func TestExportedNewWorkerRequiresExplicitBudget(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("NewWorker must not provide an exported allow-all budget path")
+		}
+	}()
+	_ = NewWorker(NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)), &fakeProvider{}, nil)
+}
+
 func TestWorkerStoresStablePublicProviderFailure(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))

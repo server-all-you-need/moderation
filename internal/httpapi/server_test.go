@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -214,6 +215,7 @@ func TestInvalidCursorAndLimitAreInvalidRequest(t *testing.T) {
 		"/api/v1/moderation-batches/" + batchID + "/items?limit=0",
 		"/api/v1/moderation-batches/" + batchID + "/items?limit=101",
 		"/internal/v1/moderation/tasks?cursor=not-base64",
+		"/internal/v1/moderation/tasks?cursor=" + base64.RawURLEncoding.EncodeToString([]byte("ks:1780000000000000000:not-a-uuid")),
 		"/internal/v1/moderation/batches?limit=abc",
 	} {
 		token := "test-token"

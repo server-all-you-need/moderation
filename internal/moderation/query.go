@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Xushengqwer/post_audit/internal/auditplatform"
+	"github.com/google/uuid"
 )
 
 type APIClient struct {
@@ -398,6 +399,9 @@ func decodeKeysetCursor(cursor string) (*keysetCursor, error) {
 	}
 	nanos, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
+		return nil, ErrInvalidCursor
+	}
+	if _, err := uuid.Parse(parts[2]); err != nil {
 		return nil, ErrInvalidCursor
 	}
 	return &keysetCursor{UpdatedAt: time.Unix(0, nanos).UTC(), ID: parts[2]}, nil

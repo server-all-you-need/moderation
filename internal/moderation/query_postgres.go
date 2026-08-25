@@ -374,6 +374,11 @@ func batchFilterSQL(filter ListFilter) (string, []interface{}) {
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf(sql, len(args)))
 	}
+	var taskClauses []string
+	addTask := func(sql string, value interface{}) {
+		args = append(args, value)
+		taskClauses = append(taskClauses, fmt.Sprintf(sql, len(args)))
+	}
 	if filter.CallerID != "" {
 		add("caller_id = $%d", filter.CallerID)
 	}
@@ -381,16 +386,19 @@ func batchFilterSQL(filter ListFilter) (string, []interface{}) {
 		add("status = $%d", filter.BatchStatus)
 	}
 	if filter.ContentType != "" {
-		add("exists (select 1 from moderation_tasks t where t.batch_id = moderation_batches.id and t.content_type = $%d)", filter.ContentType)
+		addTask("t.content_type = $%d", filter.ContentType)
 	}
 	if filter.TaskStatus != "" {
-		add("exists (select 1 from moderation_tasks t where t.batch_id = moderation_batches.id and t.status = $%d)", filter.TaskStatus)
+		addTask("t.status = $%d", filter.TaskStatus)
 	}
 	if filter.Policy != "" {
-		add("exists (select 1 from moderation_tasks t where t.batch_id = moderation_batches.id and t.policy = $%d)", filter.Policy)
+		addTask("t.policy = $%d", filter.Policy)
 	}
 	if filter.RiskLevel != "" {
-		add("exists (select 1 from moderation_tasks t where t.batch_id = moderation_batches.id and t.result_json->>'risk_level' = $%d)", filter.RiskLevel)
+		addTask("t.result_json->>'risk_level' = $%d", filter.RiskLevel)
+	}
+	if len(taskClauses) > 0 {
+		clauses = append(clauses, "exists (select 1 from moderation_tasks t where t.batch_id = moderation_batches.id and "+strings.Join(taskClauses, " and ")+")")
 	}
 	if len(clauses) == 0 {
 		return "", args

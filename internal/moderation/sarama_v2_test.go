@@ -89,6 +89,32 @@ func TestTaskConsumerStrictlyRejectsNonMinimalEvents(t *testing.T) {
 	}
 }
 
+func TestTaskConsumerGroupPoisonDLQDoesNotForwardUntrustedKafkaKey(t *testing.T) {
+	poisonPublisher := &recordingPublisher{}
+	handler := NewTaskConsumerGroupHandlerWithPoisonPublisher(NewTaskConsumer(NewWorkerWithOptions(WorkerOptions{
+		Store:          NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)),
+		Provider:       &countingProvider{},
+		ProviderBudget: allowAllProviderBudget{},
+	})), poisonPublisher)
+	messages := make(chan *sarama.ConsumerMessage, 1)
+	messages <- &sarama.ConsumerMessage{Topic: TopicModerationTasksV1, Key: []byte("https://secret.example/raw"), Value: []byte(`{"version":1,"caller_id":"client-a"}`)}
+	close(messages)
+	session := &fakeConsumerGroupSession{ctx: context.Background()}
+
+	if err := handler.ConsumeClaim(session, fakeConsumerGroupClaim{messages: messages}); err != nil {
+		t.Fatalf("ConsumeClaim poison event: %v", err)
+	}
+	if len(poisonPublisher.records) != 1 {
+		t.Fatalf("poison records = %d, want 1", len(poisonPublisher.records))
+	}
+	if poisonPublisher.records[0].key == "https://secret.example/raw" || poisonPublisher.records[0].key == "" {
+		t.Fatalf("poison DLQ key must be fixed or irreversible, got %q", poisonPublisher.records[0].key)
+	}
+	if !session.marked {
+		t.Fatalf("poison message must be marked consumed")
+	}
+}
+
 func TestTaskConsumerGroupIgnoresDuplicateTerminalEvents(t *testing.T) {
 	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
 	task, _, err := store.CreateTask(context.Background(), CreateTaskRequest{
@@ -132,4 +158,49 @@ func mustTaskEventBytes(t *testing.T, event TaskEvent) []byte {
 		t.Fatalf("marshal event: %v", err)
 	}
 	return data
+}
+
+type publisherRecord struct {
+	topic string
+	key   string
+	value []byte
+}
+
+type recordingPublisher struct {
+	records []publisherRecord
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, topic, key string, value []byte) error {
+	p.records = append(p.records, publisherRecord{topic: topic, key: key, value: append([]byte(nil), value...)})
+	return nil
+}
+
+type fakeConsumerGroupSession struct {
+	ctx    context.Context
+	marked bool
+}
+
+func (s *fakeConsumerGroupSession) Claims() map[string][]int32 { return nil }
+func (s *fakeConsumerGroupSession) MemberID() string           { return "member" }
+func (s *fakeConsumerGroupSession) GenerationID() int32        { return 1 }
+func (s *fakeConsumerGroupSession) MarkOffset(string, int32, int64, string) {
+}
+func (s *fakeConsumerGroupSession) Commit() {}
+func (s *fakeConsumerGroupSession) ResetOffset(string, int32, int64, string) {
+}
+func (s *fakeConsumerGroupSession) MarkMessage(*sarama.ConsumerMessage, string) {
+	s.marked = true
+}
+func (s *fakeConsumerGroupSession) Context() context.Context { return s.ctx }
+
+type fakeConsumerGroupClaim struct {
+	messages <-chan *sarama.ConsumerMessage
+}
+
+func (c fakeConsumerGroupClaim) Topic() string              { return TopicModerationTasksV1 }
+func (c fakeConsumerGroupClaim) Partition() int32           { return 0 }
+func (c fakeConsumerGroupClaim) InitialOffset() int64       { return 0 }
+func (c fakeConsumerGroupClaim) HighWaterMarkOffset() int64 { return 1 }
+func (c fakeConsumerGroupClaim) Messages() <-chan *sarama.ConsumerMessage {
+	return c.messages
 }

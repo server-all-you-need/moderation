@@ -85,9 +85,8 @@ type Worker struct {
 	claimFor       time.Duration
 }
 
-func NewWorker(store *MemoryStore, provider auditplatform.Provider, dlq DLQSender) *Worker {
-	_ = dlq
-	return NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ProviderBudget: allowAllProviderBudget{}, ClaimFor: 30 * time.Second})
+func NewWorker(store WorkerStore, provider auditplatform.Provider, providerBudget ProviderBudget) *Worker {
+	return NewWorkerWithOptions(WorkerOptions{Store: store, Provider: provider, ProviderBudget: providerBudget, ClaimFor: 30 * time.Second})
 }
 
 type WorkerOptions struct {

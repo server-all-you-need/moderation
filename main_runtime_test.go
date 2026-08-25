@@ -72,6 +72,13 @@ func TestSaramaConfigRejectsUnsupportedMechanismAndUnsafeIdempotentAcks(t *testi
 	if _, err := newSaramaConfig(config.KafkaConfig{Version: "2.8.1", Producer: config.ProducerConfig{RequiredAcks: "no_response", ReturnSuccesses: true, ReturnErrors: true}}); err == nil {
 		t.Fatalf("idempotent producer cannot be configured with no_response acks")
 	}
+	if _, err := newSaramaConfig(config.KafkaConfig{
+		Version:  "2.8.1",
+		Producer: config.ProducerConfig{RequiredAcks: "wait_for_all", ReturnSuccesses: true, ReturnErrors: true},
+		Consumer: config.ConsumerConfig{Offsets: config.OffsetsConfig{Initial: "middle"}},
+	}); err == nil {
+		t.Fatalf("unsupported consumer offset initial value must fail fast")
+	}
 }
 
 func writeTestTLSFiles(t *testing.T, caPath, certPath, keyPath string) {

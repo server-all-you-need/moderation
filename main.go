@@ -262,7 +262,9 @@ func newSaramaConfig(cfg config.KafkaConfig) (*sarama.Config, error) {
 	if err := applyKafkaProducer(saramaCfg, cfg.Producer); err != nil {
 		return nil, err
 	}
-	applyKafkaConsumer(saramaCfg, cfg.Consumer)
+	if err := applyKafkaConsumer(saramaCfg, cfg.Consumer); err != nil {
+		return nil, err
+	}
 	if err := saramaCfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -356,7 +358,7 @@ func applyKafkaProducer(saramaCfg *sarama.Config, cfg config.ProducerConfig) err
 	return nil
 }
 
-func applyKafkaConsumer(saramaCfg *sarama.Config, cfg config.ConsumerConfig) {
+func applyKafkaConsumer(saramaCfg *sarama.Config, cfg config.ConsumerConfig) error {
 	saramaCfg.Consumer.Offsets.AutoCommit.Enable = cfg.Offsets.AutoCommitEnable
 	if cfg.Offsets.AutoCommitIntervalMs > 0 {
 		saramaCfg.Consumer.Offsets.AutoCommit.Interval = cfg.Offsets.AutoCommitIntervalMs * time.Millisecond
@@ -367,12 +369,15 @@ func applyKafkaConsumer(saramaCfg *sarama.Config, cfg config.ConsumerConfig) {
 	if cfg.HeartbeatIntervalMs > 0 {
 		saramaCfg.Consumer.Group.Heartbeat.Interval = cfg.HeartbeatIntervalMs * time.Millisecond
 	}
-	switch strings.ToLower(firstNonEmpty(cfg.Offsets.Initial, cfg.AutoOffsetReset)) {
+	switch initial := strings.ToLower(firstNonEmpty(cfg.Offsets.Initial, cfg.AutoOffsetReset)); initial {
+	case "", "earliest":
+		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
 	case "latest":
 		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetNewest
 	default:
-		saramaCfg.Consumer.Offsets.Initial = sarama.OffsetOldest
+		return fmt.Errorf("unsupported kafka consumer offset initial %q", initial)
 	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

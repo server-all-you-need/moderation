@@ -160,7 +160,7 @@ func TestWorkerDoesNotCallProviderForTerminalOrActivelyClaimedDuplicateEvents(t 
 		t.Fatalf("create task: %v", err)
 	}
 	provider := &fakeProvider{}
-	worker := NewWorker(store, provider, &fakeDLQ{})
+	worker := NewWorker(store, provider, allowAllProviderBudget{})
 
 	if _, claimed, err := store.ClaimTaskForProcessing(ctx, task.ID, 30*time.Second); err != nil || !claimed {
 		t.Fatalf("pre-claim task: claimed=%v err=%v", claimed, err)
@@ -203,7 +203,7 @@ func TestWorkerRetriesRetryableFailuresThenSendsContentFreeDLQWhenExhausted(t *t
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 4"},
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Retryable: true, Message: "temporary 5"},
 	}}
-	worker := NewWorker(store, provider, nil)
+	worker := NewWorker(store, provider, allowAllProviderBudget{})
 
 	expectedDelays := []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
 	for i, delay := range expectedDelays {
@@ -244,7 +244,7 @@ func TestWorkerPermanentProviderFailureFailsWithoutRetry(t *testing.T) {
 	}
 	worker := NewWorker(store, &fakeProvider{errors: []error{
 		&auditplatform.ProviderError{Code: auditplatform.ErrorCodeInvalidRequest, Retryable: false, Message: "bad request"},
-	}}, nil)
+	}}, allowAllProviderBudget{})
 
 	if err := worker.ProcessTaskEvent(ctx, TaskEventFromTask(task)); err != nil {
 		t.Fatalf("process permanent failure: %v", err)
