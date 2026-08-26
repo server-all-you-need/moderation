@@ -3,7 +3,6 @@ package moderation
 import (
 	"bytes"
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -55,8 +54,61 @@ func TestMarshalTaskWebhookEventCarriesFullOutcomeWithoutRawInput(t *testing.T) 
 	if event.Status != TaskStatusSucceeded || !event.OccurredAt.Equal(now) || event.Result == nil || event.Error != nil {
 		t.Fatalf("unexpected outcome fields: %#v", event)
 	}
-	if !reflect.DeepEqual(*event.Result, result) {
+	if event.Result.ClientItemID != "avatar-user-42" ||
+		event.Result.Decision != auditplatform.DecisionPass ||
+		event.Result.RiskLevel != auditplatform.RiskLevelLow ||
+		event.Result.ProviderName != "aliyun" ||
+		event.Result.ProviderRequestID != "provider-request-id" ||
+		event.Result.ProviderDataID != "provider-data-id" ||
+		len(event.Result.Labels) != 0 {
 		t.Fatalf("unexpected result: %#v", event.Result)
+	}
+}
+
+func TestMarshalTaskWebhookEventOmitsProviderRiskWords(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 15, 0, 0, time.UTC)
+	result := auditplatform.ModerationResult{
+		ClientItemID: "comment-99",
+		Decision:     auditplatform.DecisionReview,
+		RiskLevel:    auditplatform.RiskLevelMedium,
+		ProviderName: "aliyun",
+		Labels: []auditplatform.LabelEntry{
+			{
+				Label:       "politics",
+				Confidence:  88.5,
+				Description: "needs manual review",
+				RiskWords:   []string{"sensitive original phrase"},
+			},
+		},
+	}
+	task := Task{
+		ID:           "task-risk-words",
+		ClientItemID: "comment-99",
+		ContentType:  auditplatform.ContentTypeText,
+		Policy:       auditplatform.PolicyTextComment,
+		Status:       TaskStatusSucceeded,
+		Result:       &result,
+		TerminalAt:   &now,
+	}
+
+	body, err := marshalTaskWebhookEvent("event-risk-words", task)
+	if err != nil {
+		t.Fatalf("marshal task event: %v", err)
+	}
+	if bytes.Contains(body, []byte("sensitive original phrase")) || bytes.Contains(body, []byte(`"risk_words"`)) {
+		t.Fatalf("event leaked provider risk words: %s", body)
+	}
+
+	var event taskWebhookEvent
+	if err := json.Unmarshal(body, &event); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if event.Result == nil || len(event.Result.Labels) != 1 {
+		t.Fatalf("expected public label result, got %#v", event.Result)
+	}
+	label := event.Result.Labels[0]
+	if label.Label != "politics" || label.Confidence != 88.5 || label.Description != "needs manual review" {
+		t.Fatalf("unexpected public label fields: %#v", label)
 	}
 }
 

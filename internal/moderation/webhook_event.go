@@ -11,18 +11,34 @@ import (
 const WebhookEventVersion = 2
 
 type taskWebhookEvent struct {
-	EventVersion int                             `json:"event_version"`
-	EventID      string                          `json:"event_id"`
-	Type         string                          `json:"type"`
-	ID           string                          `json:"id"`
-	BatchID      string                          `json:"batch_id,omitempty"`
-	ClientItemID string                          `json:"client_item_id"`
-	ContentType  auditplatform.ContentType       `json:"content_type"`
-	Policy       auditplatform.Policy            `json:"policy"`
-	Status       TaskStatus                      `json:"status"`
-	OccurredAt   time.Time                       `json:"occurred_at"`
-	Result       *auditplatform.ModerationResult `json:"result,omitempty"`
-	Error        *TaskError                      `json:"error,omitempty"`
+	EventVersion int                       `json:"event_version"`
+	EventID      string                    `json:"event_id"`
+	Type         string                    `json:"type"`
+	ID           string                    `json:"id"`
+	BatchID      string                    `json:"batch_id,omitempty"`
+	ClientItemID string                    `json:"client_item_id"`
+	ContentType  auditplatform.ContentType `json:"content_type"`
+	Policy       auditplatform.Policy      `json:"policy"`
+	Status       TaskStatus                `json:"status"`
+	OccurredAt   time.Time                 `json:"occurred_at"`
+	Result       *webhookModerationResult  `json:"result,omitempty"`
+	Error        *TaskError                `json:"error,omitempty"`
+}
+
+type webhookModerationResult struct {
+	ClientItemID      string                  `json:"client_item_id"`
+	Decision          auditplatform.Decision  `json:"decision"`
+	RiskLevel         auditplatform.RiskLevel `json:"risk_level"`
+	ProviderName      string                  `json:"provider_name"`
+	ProviderRequestID string                  `json:"provider_request_id,omitempty"`
+	ProviderDataID    string                  `json:"provider_data_id,omitempty"`
+	Labels            []webhookLabelEntry     `json:"labels,omitempty"`
+}
+
+type webhookLabelEntry struct {
+	Label       string  `json:"label"`
+	Confidence  float64 `json:"confidence,omitempty"`
+	Description string  `json:"description,omitempty"`
 }
 
 type batchWebhookSummary struct {
@@ -66,7 +82,7 @@ func marshalTaskWebhookEvent(eventID string, task Task) ([]byte, error) {
 		if task.Result == nil || task.Error != nil {
 			return nil, fmt.Errorf("succeeded task webhook event requires result only")
 		}
-		result := *task.Result
+		result := publicWebhookResult(*task.Result)
 		event.Result = &result
 	case TaskStatusFailed:
 		if task.Error == nil || task.Result != nil {
@@ -79,6 +95,28 @@ func marshalTaskWebhookEvent(eventID string, task Task) ([]byte, error) {
 	}
 
 	return json.Marshal(event)
+}
+
+func publicWebhookResult(result auditplatform.ModerationResult) webhookModerationResult {
+	publicResult := webhookModerationResult{
+		ClientItemID:      result.ClientItemID,
+		Decision:          result.Decision,
+		RiskLevel:         result.RiskLevel,
+		ProviderName:      result.ProviderName,
+		ProviderRequestID: result.ProviderRequestID,
+		ProviderDataID:    result.ProviderDataID,
+	}
+	if len(result.Labels) > 0 {
+		publicResult.Labels = make([]webhookLabelEntry, 0, len(result.Labels))
+		for _, label := range result.Labels {
+			publicResult.Labels = append(publicResult.Labels, webhookLabelEntry{
+				Label:       label.Label,
+				Confidence:  label.Confidence,
+				Description: label.Description,
+			})
+		}
+	}
+	return publicResult
 }
 
 func marshalBatchWebhookEvent(eventID string, batch Batch) ([]byte, error) {
