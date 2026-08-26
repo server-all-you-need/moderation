@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/server-all-you-need/moderation/internal/auditplatform"
 	"github.com/server-all-you-need/moderation/internal/moderation"
 )
@@ -124,6 +125,38 @@ func doJSON(server *Server, method, path, token string, headers map[string]strin
 	rec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(rec, req)
 	return rec
+}
+
+func TestServerUsesGinWithExactRoutingSemantics(t *testing.T) {
+	server, _, _, _ := newTestServer(t)
+
+	if _, ok := server.Handler().(*gin.Engine); !ok {
+		t.Fatalf("handler type = %T, want *gin.Engine", server.Handler())
+	}
+
+	wrongMethod := doJSON(server, http.MethodDelete, "/healthz", "", nil, "")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status = %d, want 405 body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+
+	trailingSlash := doJSON(server, http.MethodGet, "/healthz/", "", nil, "")
+	if trailingSlash.Code != http.StatusNotFound || trailingSlash.Header().Get("Location") != "" {
+		t.Fatalf("trailing slash response = %d location=%q, want exact-route 404 without redirect", trailingSlash.Code, trailingSlash.Header().Get("Location"))
+	}
+
+	created := doJSON(server, http.MethodPost, "/api/v1/moderation-tasks", "test-token", map[string]string{"Idempotency-Key": "gin-path-param"}, `{"client_item_id":"post-gin","content_type":"text","policy":"text.general","text":"hello"}`)
+	if created.Code != http.StatusAccepted {
+		t.Fatalf("create task status = %d, want 202 body=%s", created.Code, created.Body.String())
+	}
+	var response map[string]interface{}
+	if err := json.Unmarshal(created.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode create task response: %v", err)
+	}
+	taskID, _ := response["task_id"].(string)
+	got := doJSON(server, http.MethodGet, "/api/v1/moderation-tasks/"+taskID, "test-token", nil, "")
+	if got.Code != http.StatusOK {
+		t.Fatalf("Gin path parameter lookup status = %d, want 200 body=%s", got.Code, got.Body.String())
+	}
 }
 
 func TestPublicAuthScopesStrictJSONAndSyncProviderBudget(t *testing.T) {

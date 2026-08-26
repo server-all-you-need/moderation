@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/server-all-you-need/moderation/internal/auditplatform"
 	"github.com/server-all-you-need/moderation/internal/moderation"
 )
@@ -80,7 +81,7 @@ type Server struct {
 	clients   []ClientConfig
 	adminHash string
 	ready     func(context.Context) error
-	mux       *http.ServeMux
+	engine    *gin.Engine
 	publicOps []operation
 }
 
@@ -140,99 +141,103 @@ func NewServer(cfg Config) (*Server, error) {
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	return s.engine
 }
 
 func (s *Server) routes() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", s.healthz)
-	mux.HandleFunc("GET /readyz", s.readyz)
-	mux.HandleFunc("GET /openapi.json", s.openapi)
-	mux.HandleFunc("POST /api/v1/moderations:check", s.handleSyncCheck)
-	mux.HandleFunc("POST /api/v1/moderation-tasks", s.handleCreateTask)
-	mux.HandleFunc("GET /api/v1/moderation-tasks/{id}", s.handleGetTask)
-	mux.HandleFunc("POST /api/v1/moderation-batches", s.handleCreateBatch)
-	mux.HandleFunc("GET /api/v1/moderation-batches/{id}", s.handleGetBatch)
-	mux.HandleFunc("GET /api/v1/moderation-batches/{id}/items", s.handleBatchItems)
-	mux.HandleFunc("GET /internal/v1/moderation/stats", s.handleAdminStats)
-	mux.HandleFunc("GET /internal/v1/moderation/clients", s.handleAdminClients)
-	mux.HandleFunc("GET /internal/v1/moderation/tasks", s.handleAdminTasks)
-	mux.HandleFunc("GET /internal/v1/moderation/tasks/{id}", s.handleAdminTask)
-	mux.HandleFunc("GET /internal/v1/moderation/batches", s.handleAdminBatches)
-	mux.HandleFunc("GET /internal/v1/moderation/batches/{id}", s.handleAdminBatch)
-	mux.HandleFunc("GET /internal/v1/moderation/batches/{id}/items", s.handleAdminBatchItems)
-	s.mux = mux
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	engine.RedirectTrailingSlash = false
+	engine.HandleMethodNotAllowed = true
+	engine.Use(gin.Recovery())
+	engine.GET("/healthz", s.healthz)
+	engine.GET("/readyz", s.readyz)
+	engine.GET("/openapi.json", s.openapi)
+	engine.POST("/api/v1/moderations:check", s.handleSyncCheck)
+	engine.POST("/api/v1/moderation-tasks", s.handleCreateTask)
+	engine.GET("/api/v1/moderation-tasks/:id", s.handleGetTask)
+	engine.POST("/api/v1/moderation-batches", s.handleCreateBatch)
+	engine.GET("/api/v1/moderation-batches/:id", s.handleGetBatch)
+	engine.GET("/api/v1/moderation-batches/:id/items", s.handleBatchItems)
+	engine.GET("/internal/v1/moderation/stats", s.handleAdminStats)
+	engine.GET("/internal/v1/moderation/clients", s.handleAdminClients)
+	engine.GET("/internal/v1/moderation/tasks", s.handleAdminTasks)
+	engine.GET("/internal/v1/moderation/tasks/:id", s.handleAdminTask)
+	engine.GET("/internal/v1/moderation/batches", s.handleAdminBatches)
+	engine.GET("/internal/v1/moderation/batches/:id", s.handleAdminBatch)
+	engine.GET("/internal/v1/moderation/batches/:id/items", s.handleAdminBatchItems)
+	s.engine = engine
 }
 
-func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+func (s *Server) healthz(ctx *gin.Context) {
+	writeJSON(ctx, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
-	if err := s.ready(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "service dependencies are not ready")
+func (s *Server) readyz(ctx *gin.Context) {
+	if err := s.ready(ctx.Request.Context()); err != nil {
+		writeError(ctx, http.StatusServiceUnavailable, "dependency_unavailable", "service dependencies are not ready")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+	writeJSON(ctx, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-func (s *Server) openapi(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(openAPIJSON)
+func (s *Server) openapi(ctx *gin.Context) {
+	ctx.Header("Content-Type", "application/json")
+	ctx.Status(http.StatusOK)
+	_, _ = ctx.Writer.Write(openAPIJSON)
 }
 
-func (s *Server) handleSyncCheck(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeCheck)
+func (s *Server) handleSyncCheck(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeCheck)
 	if !ok {
 		return
 	}
 	var req syncModerationRequest
-	if !decodeRequest(w, r, &req) {
+	if !decodeRequest(ctx, &req) {
 		return
 	}
 	input := req.toInput()
 	if err := input.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(ctx, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if !s.acquireSync(w, r, client.ID) {
+	if !s.acquireSync(ctx, client.ID) {
 		return
 	}
-	result, err := s.provider.Moderate(r.Context(), input)
+	result, err := s.provider.Moderate(ctx.Request.Context(), input)
 	if err != nil {
-		writeProviderError(w, err)
+		writeProviderError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, taskResultDTO(result))
+	writeJSON(ctx, http.StatusOK, taskResultDTO(result))
 }
 
-func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeSubmit)
+func (s *Server) handleCreateTask(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeSubmit)
 	if !ok {
 		return
 	}
-	if !s.acquireCaller(w, r, client.ID) {
+	if !s.acquireCaller(ctx, client.ID) {
 		return
 	}
-	idem, ok := requireIdempotencyKey(w, r)
+	idem, ok := requireIdempotencyKey(ctx)
 	if !ok {
 		return
 	}
 	var req asyncModerationRequest
-	if !decodeRequest(w, r, &req) {
+	if !decodeRequest(ctx, &req) {
 		return
 	}
 	input := req.toInput()
 	if err := input.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(ctx, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	if req.WebhookURL != "" && !client.webhookAllowed(req.WebhookURL) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
 		return
 	}
-	task, _, err := s.store.CreateTask(r.Context(), moderation.CreateTaskRequest{
+	task, _, err := s.store.CreateTask(ctx.Request.Context(), moderation.CreateTaskRequest{
 		CallerID:       client.ID,
 		Operation:      "task",
 		IdempotencyKey: idem,
@@ -241,66 +246,66 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		WebhookURL:     req.WebhookURL,
 	})
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, taskAcceptedDTO(task))
+	writeJSON(ctx, http.StatusAccepted, taskAcceptedDTO(task))
 }
 
-func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeRead)
+func (s *Server) handleGetTask(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeRead)
 	if !ok {
 		return
 	}
-	if !s.acquireCaller(w, r, client.ID) {
+	if !s.acquireCaller(ctx, client.ID) {
 		return
 	}
-	task, found, err := s.store.GetTask(r.Context(), client.ID, r.PathValue("id"))
+	task, found, err := s.store.GetTask(ctx.Request.Context(), client.ID, ctx.Param("id"))
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		writeError(ctx, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, taskDTO(task))
+	writeJSON(ctx, http.StatusOK, taskDTO(task))
 }
 
-func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeSubmit)
+func (s *Server) handleCreateBatch(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeSubmit)
 	if !ok {
 		return
 	}
-	if !s.acquireCaller(w, r, client.ID) {
+	if !s.acquireCaller(ctx, client.ID) {
 		return
 	}
-	idem, ok := requireIdempotencyKey(w, r)
+	idem, ok := requireIdempotencyKey(ctx)
 	if !ok {
 		return
 	}
 	var req batchRequest
-	if !decodeRequest(w, r, &req) {
+	if !decodeRequest(ctx, &req) {
 		return
 	}
 	if len(req.Items) < 1 || len(req.Items) > 100 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "items length must be 1-100")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "items length must be 1-100")
 		return
 	}
 	inputs := make([]auditplatform.ModerationInput, 0, len(req.Items))
 	for _, item := range req.Items {
 		input := item.toInput()
 		if err := input.Validate(); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			writeError(ctx, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
 		inputs = append(inputs, input)
 	}
 	if req.WebhookURL != "" && !client.webhookAllowed(req.WebhookURL) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
 		return
 	}
-	batch, _, _, err := s.store.CreateBatch(r.Context(), moderation.CreateBatchRequest{
+	batch, _, _, err := s.store.CreateBatch(ctx.Request.Context(), moderation.CreateBatchRequest{
 		CallerID:       client.ID,
 		Operation:      "batch",
 		IdempotencyKey: idem,
@@ -309,192 +314,192 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		WebhookURL:     req.WebhookURL,
 	})
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, batchDTO(batch))
+	writeJSON(ctx, http.StatusAccepted, batchDTO(batch))
 }
 
-func (s *Server) handleGetBatch(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeRead)
+func (s *Server) handleGetBatch(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeRead)
 	if !ok {
 		return
 	}
-	if !s.acquireCaller(w, r, client.ID) {
+	if !s.acquireCaller(ctx, client.ID) {
 		return
 	}
-	batch, found, err := s.store.GetBatch(r.Context(), client.ID, r.PathValue("id"))
+	batch, found, err := s.store.GetBatch(ctx.Request.Context(), client.ID, ctx.Param("id"))
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		writeError(ctx, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, batchDTO(batch))
+	writeJSON(ctx, http.StatusOK, batchDTO(batch))
 }
 
-func (s *Server) handleBatchItems(w http.ResponseWriter, r *http.Request) {
-	client, ok := s.requirePublic(w, r, ScopeRead)
+func (s *Server) handleBatchItems(ctx *gin.Context) {
+	client, ok := s.requirePublic(ctx, ScopeRead)
 	if !ok {
 		return
 	}
-	if !s.acquireCaller(w, r, client.ID) {
+	if !s.acquireCaller(ctx, client.ID) {
 		return
 	}
-	limit, err := queryLimit(r)
+	limit, err := queryLimit(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
 		return
 	}
-	page, err := s.store.ListBatchItems(r.Context(), client.ID, r.PathValue("id"), moderation.BatchItemCursor{Limit: limit, Cursor: r.URL.Query().Get("cursor")})
+	page, err := s.store.ListBatchItems(ctx.Request.Context(), client.ID, ctx.Param("id"), moderation.BatchItemCursor{Limit: limit, Cursor: ctx.Query("cursor")})
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": tasksDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(ctx, http.StatusOK, map[string]interface{}{"items": tasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
-func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminStats(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	stats, err := s.store.AdminStats(r.Context())
+	stats, err := s.store.AdminStats(ctx.Request.Context())
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
 	if s.lag != nil {
-		lag, err := s.lag.ConsumerLag(r.Context())
+		lag, err := s.lag.ConsumerLag(ctx.Request.Context())
 		if err != nil {
-			writeStoreError(w, err)
+			writeStoreError(ctx, err)
 			return
 		}
 		stats.KafkaConsumerLag = lag
 	}
-	writeJSON(w, http.StatusOK, stats)
+	writeJSON(ctx, http.StatusOK, stats)
 }
 
-func (s *Server) handleAdminClients(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminClients(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	clients, err := s.store.ListAPIClients(r.Context())
+	clients, err := s.store.ListAPIClients(ctx.Request.Context())
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": clients})
+	writeJSON(ctx, http.StatusOK, map[string]interface{}{"items": clients})
 }
 
-func (s *Server) handleAdminTasks(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminTasks(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	filter, err := filterFromRequest(r, false)
+	filter, err := filterFromRequest(ctx, false)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
 		return
 	}
-	page, err := s.store.ListTasks(r.Context(), filter)
+	page, err := s.store.ListTasks(ctx.Request.Context(), filter)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(ctx, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
-func (s *Server) handleAdminTask(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminTask(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	task, found, err := s.store.GetAdminTask(r.Context(), r.PathValue("id"))
+	task, found, err := s.store.GetAdminTask(ctx.Request.Context(), ctx.Param("id"))
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		writeError(ctx, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, internalTaskDTO(task))
+	writeJSON(ctx, http.StatusOK, internalTaskDTO(task))
 }
 
-func (s *Server) handleAdminBatches(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminBatches(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	filter, err := filterFromRequest(r, true)
+	filter, err := filterFromRequest(ctx, true)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
 		return
 	}
-	page, err := s.store.ListBatches(r.Context(), filter)
+	page, err := s.store.ListBatches(ctx.Request.Context(), filter)
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalBatchesDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(ctx, http.StatusOK, map[string]interface{}{"items": internalBatchesDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
-func (s *Server) handleAdminBatch(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminBatch(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	batch, found, err := s.store.GetAdminBatch(r.Context(), r.PathValue("id"))
+	batch, found, err := s.store.GetAdminBatch(ctx.Request.Context(), ctx.Param("id"))
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		writeError(ctx, http.StatusNotFound, "not_found", "resource not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, internalBatchDTO(batch))
+	writeJSON(ctx, http.StatusOK, internalBatchDTO(batch))
 }
 
-func (s *Server) handleAdminBatchItems(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAdmin(w, r) {
+func (s *Server) handleAdminBatchItems(ctx *gin.Context) {
+	if !s.requireAdmin(ctx) {
 		return
 	}
-	limit, err := queryLimit(r)
+	limit, err := queryLimit(ctx)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "limit must be between 1 and 100")
 		return
 	}
-	page, err := s.store.ListAdminBatchItems(r.Context(), r.PathValue("id"), moderation.BatchItemCursor{Limit: limit, Cursor: r.URL.Query().Get("cursor")})
+	page, err := s.store.ListAdminBatchItems(ctx.Request.Context(), ctx.Param("id"), moderation.BatchItemCursor{Limit: limit, Cursor: ctx.Query("cursor")})
 	if err != nil {
-		writeStoreError(w, err)
+		writeStoreError(ctx, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
+	writeJSON(ctx, http.StatusOK, map[string]interface{}{"items": internalTasksDTO(page.Items), "next_cursor": page.NextCursor})
 }
 
-func (s *Server) requirePublic(w http.ResponseWriter, r *http.Request, scope string) (ClientConfig, bool) {
-	client, ok := s.authenticateClient(r)
+func (s *Server) requirePublic(ctx *gin.Context, scope string) (ClientConfig, bool) {
+	client, ok := s.authenticateClient(ctx)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		writeError(ctx, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
 		return ClientConfig{}, false
 	}
 	if !client.hasScope(scope) {
-		writeError(w, http.StatusForbidden, "forbidden", "missing required scope")
+		writeError(ctx, http.StatusForbidden, "forbidden", "missing required scope")
 		return ClientConfig{}, false
 	}
 	return client, true
 }
 
-func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	token, ok := bearerToken(r)
+func (s *Server) requireAdmin(ctx *gin.Context) bool {
+	token, ok := bearerToken(ctx)
 	if !ok || !constantTimeSHA256(token, s.adminHash) {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		writeError(ctx, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
 		return false
 	}
 	return true
 }
 
-func (s *Server) authenticateClient(r *http.Request) (ClientConfig, bool) {
-	token, ok := bearerToken(r)
+func (s *Server) authenticateClient(ctx *gin.Context) (ClientConfig, bool) {
+	token, ok := bearerToken(ctx)
 	if !ok {
 		return ClientConfig{}, false
 	}
@@ -502,57 +507,57 @@ func (s *Server) authenticateClient(r *http.Request) (ClientConfig, bool) {
 	return client, matched
 }
 
-func (s *Server) acquireCaller(w http.ResponseWriter, r *http.Request, callerID string) bool {
-	outcome, err := s.limiter.AcquireCaller(r.Context(), callerID)
-	return writeLimitOutcome(w, outcome, err)
+func (s *Server) acquireCaller(ctx *gin.Context, callerID string) bool {
+	outcome, err := s.limiter.AcquireCaller(ctx.Request.Context(), callerID)
+	return writeLimitOutcome(ctx, outcome, err)
 }
 
-func (s *Server) acquireSync(w http.ResponseWriter, r *http.Request, callerID string) bool {
-	outcome, err := s.limiter.AcquireSyncProvider(r.Context(), callerID)
-	return writeLimitOutcome(w, outcome, err)
+func (s *Server) acquireSync(ctx *gin.Context, callerID string) bool {
+	outcome, err := s.limiter.AcquireSyncProvider(ctx.Request.Context(), callerID)
+	return writeLimitOutcome(ctx, outcome, err)
 }
 
-func writeLimitOutcome(w http.ResponseWriter, outcome moderation.LimitOutcome, err error) bool {
+func writeLimitOutcome(ctx *gin.Context, outcome moderation.LimitOutcome, err error) bool {
 	if err != nil || outcome.Reason == moderation.LimitRedisFailure {
-		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", "rate limiter unavailable")
+		writeError(ctx, http.StatusServiceUnavailable, "dependency_unavailable", "rate limiter unavailable")
 		return false
 	}
 	if !outcome.Allowed {
-		writeError(w, http.StatusTooManyRequests, "rate_limited", string(outcome.Reason))
+		writeError(ctx, http.StatusTooManyRequests, "rate_limited", string(outcome.Reason))
 		return false
 	}
 	return true
 }
 
-func decodeRequest(w http.ResponseWriter, r *http.Request, dest interface{}) bool {
-	if r.Body == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "request body is required")
+func decodeRequest(ctx *gin.Context, dest interface{}) bool {
+	if ctx.Request.Body == nil {
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "request body is required")
 		return false
 	}
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes))
+	decoder := json.NewDecoder(http.MaxBytesReader(ctx.Writer, ctx.Request.Body, MaxJSONBodyBytes))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dest); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON request")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "invalid JSON request")
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain one JSON value")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "request body must contain one JSON value")
 		return false
 	}
 	return true
 }
 
-func requireIdempotencyKey(w http.ResponseWriter, r *http.Request) (string, bool) {
-	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+func requireIdempotencyKey(ctx *gin.Context) (string, bool) {
+	key := strings.TrimSpace(ctx.GetHeader("Idempotency-Key"))
 	if key == "" || len(key) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "Idempotency-Key is required")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "Idempotency-Key is required")
 		return "", false
 	}
 	return key, true
 }
 
-func bearerToken(r *http.Request) (string, bool) {
-	header := r.Header.Get("Authorization")
+func bearerToken(ctx *gin.Context) (string, bool) {
+	header := ctx.GetHeader("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) {
 		return "", false
@@ -782,41 +787,41 @@ func internalBatchesDTO(batches []moderation.Batch) []internalBatchResponse {
 	return out
 }
 
-func writeJSON(w http.ResponseWriter, status int, value interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+func writeJSON(ctx *gin.Context, status int, value interface{}) {
+	ctx.Header("Content-Type", "application/json")
+	ctx.Status(status)
+	_ = json.NewEncoder(ctx.Writer).Encode(value)
 }
 
-func writeError(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, map[string]interface{}{"error": map[string]string{"code": code, "message": message}})
+func writeError(ctx *gin.Context, status int, code, message string) {
+	writeJSON(ctx, status, map[string]interface{}{"error": map[string]string{"code": code, "message": message}})
 }
 
-func writeProviderError(w http.ResponseWriter, err error) {
+func writeProviderError(ctx *gin.Context, err error) {
 	var providerErr *auditplatform.ProviderError
 	if errors.As(err, &providerErr) {
 		status := http.StatusBadGateway
 		if providerErr.Code == auditplatform.ErrorCodeInvalidInput || providerErr.Code == auditplatform.ErrorCodeInvalidRequest {
 			status = http.StatusBadRequest
 		}
-		writeError(w, status, "provider_failure", providerErr.Code)
+		writeError(ctx, status, "provider_failure", providerErr.Code)
 		return
 	}
-	writeError(w, http.StatusBadGateway, "provider_failure", "provider failed")
+	writeError(ctx, http.StatusBadGateway, "provider_failure", "provider failed")
 }
 
-func writeStoreError(w http.ResponseWriter, err error) {
+func writeStoreError(ctx *gin.Context, err error) {
 	switch {
 	case errors.Is(err, moderation.ErrIdempotencyConflict):
-		writeError(w, http.StatusConflict, "idempotency_conflict", "same idempotency key was used with a different payload")
+		writeError(ctx, http.StatusConflict, "idempotency_conflict", "same idempotency key was used with a different payload")
 	case errors.Is(err, moderation.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		writeError(ctx, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, moderation.ErrWebhookNotAllowed):
-		writeError(w, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
+		writeError(ctx, http.StatusBadRequest, "invalid_request", "webhook_url is not registered")
 	case errors.Is(err, moderation.ErrInvalidCursor), errors.Is(err, moderation.ErrInvalidLimit):
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(ctx, http.StatusBadRequest, "invalid_request", err.Error())
 	default:
-		writeError(w, http.StatusInternalServerError, "dependency_unavailable", "dependency unavailable")
+		writeError(ctx, http.StatusInternalServerError, "dependency_unavailable", "dependency unavailable")
 	}
 }
 
@@ -826,8 +831,8 @@ func canonicalHash(value interface{}) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func queryLimit(r *http.Request) (int, error) {
-	raw := r.URL.Query().Get("limit")
+func queryLimit(ctx *gin.Context) (int, error) {
+	raw := ctx.Query("limit")
 	if raw == "" {
 		return 0, nil
 	}
@@ -838,24 +843,23 @@ func queryLimit(r *http.Request) (int, error) {
 	return limit, nil
 }
 
-func filterFromRequest(r *http.Request, batch bool) (moderation.ListFilter, error) {
-	q := r.URL.Query()
-	limit, err := queryLimit(r)
+func filterFromRequest(ctx *gin.Context, batch bool) (moderation.ListFilter, error) {
+	limit, err := queryLimit(ctx)
 	if err != nil {
 		return moderation.ListFilter{}, err
 	}
 	filter := moderation.ListFilter{
-		CallerID:    q.Get("caller_id"),
-		ContentType: auditplatform.ContentType(q.Get("content_type")),
-		RiskLevel:   auditplatform.RiskLevel(q.Get("risk")),
-		Policy:      auditplatform.Policy(q.Get("policy")),
+		CallerID:    ctx.Query("caller_id"),
+		ContentType: auditplatform.ContentType(ctx.Query("content_type")),
+		RiskLevel:   auditplatform.RiskLevel(ctx.Query("risk")),
+		Policy:      auditplatform.Policy(ctx.Query("policy")),
 		Limit:       limit,
-		Cursor:      q.Get("cursor"),
+		Cursor:      ctx.Query("cursor"),
 	}
 	if batch {
-		filter.BatchStatus = moderation.BatchStatus(q.Get("status"))
+		filter.BatchStatus = moderation.BatchStatus(ctx.Query("status"))
 	} else {
-		filter.TaskStatus = moderation.TaskStatus(q.Get("status"))
+		filter.TaskStatus = moderation.TaskStatus(ctx.Query("status"))
 	}
 	return filter, nil
 }
