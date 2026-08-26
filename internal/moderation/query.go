@@ -313,7 +313,7 @@ func (s *MemoryStore) AdminStats(context.Context) (AdminStatsSnapshot, error) {
 		}
 	}
 	for _, row := range s.webhookRows {
-		if row.DeliveredAt == nil {
+		if row.DeliveredAt == nil && row.Attempts < len(WebhookAttemptSchedule()) {
 			if row.ClaimedUntil != nil && row.ClaimedUntil.After(s.now) {
 				stats.ClaimedWebhookOutbox++
 			} else {

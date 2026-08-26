@@ -134,7 +134,7 @@ func (s *MemoryStore) CreateBatch(_ context.Context, req CreateBatchRequest) (Ba
 
 	tasks := make([]Task, 0, len(req.Inputs))
 	for _, input := range req.Inputs {
-		task := s.newTaskLocked(req.CallerID, batch.ID, input, "")
+		task := s.newTaskLocked(req.CallerID, batch.ID, input, req.WebhookURL)
 		s.tasks[task.ID] = task
 		s.batchTasks[batch.ID] = append(s.batchTasks[batch.ID], task.ID)
 		outboxRow := taskOutboxFromTask(task, s.now)
@@ -156,6 +156,7 @@ func (s *MemoryStore) CompleteTask(_ context.Context, taskID string, result audi
 	if task.Status == TaskStatusSucceeded || task.Status == TaskStatusFailed {
 		return nil
 	}
+	originalTask := task
 	now := s.now
 	task.Status = TaskStatusSucceeded
 	task.Text = nil
@@ -166,9 +167,22 @@ func (s *MemoryStore) CompleteTask(_ context.Context, taskID string, result audi
 	task.NextAttemptAt = nil
 	task.UpdatedAt = now
 	task.TerminalAt = &now
+	taskWebhookRow, hasTaskWebhook, err := s.webhookRowForTerminalTaskLocked(task)
+	if err != nil {
+		return err
+	}
 	s.tasks[taskID] = task
-	s.deriveBatchLocked(task.BatchID)
-	s.createWebhookForTerminalTaskLocked(task)
+	batchWebhookRow, hasBatchWebhook, err := s.deriveBatchLocked(task.BatchID)
+	if err != nil {
+		s.tasks[taskID] = originalTask
+		return err
+	}
+	if hasTaskWebhook {
+		s.webhookRows[taskWebhookRow.ID] = taskWebhookRow
+	}
+	if hasBatchWebhook {
+		s.webhookRows[batchWebhookRow.ID] = batchWebhookRow
+	}
 	return nil
 }
 
@@ -183,6 +197,7 @@ func (s *MemoryStore) FailTask(_ context.Context, taskID string, taskErr TaskErr
 	if task.Status == TaskStatusSucceeded || task.Status == TaskStatusFailed {
 		return nil
 	}
+	originalTask := task
 	now := s.now
 	task.Status = TaskStatusFailed
 	task.Text = nil
@@ -193,9 +208,22 @@ func (s *MemoryStore) FailTask(_ context.Context, taskID string, taskErr TaskErr
 	task.NextAttemptAt = nil
 	task.UpdatedAt = now
 	task.TerminalAt = &now
+	taskWebhookRow, hasTaskWebhook, err := s.webhookRowForTerminalTaskLocked(task)
+	if err != nil {
+		return err
+	}
 	s.tasks[taskID] = task
-	s.deriveBatchLocked(task.BatchID)
-	s.createWebhookForTerminalTaskLocked(task)
+	batchWebhookRow, hasBatchWebhook, err := s.deriveBatchLocked(task.BatchID)
+	if err != nil {
+		s.tasks[taskID] = originalTask
+		return err
+	}
+	if hasTaskWebhook {
+		s.webhookRows[taskWebhookRow.ID] = taskWebhookRow
+	}
+	if hasBatchWebhook {
+		s.webhookRows[batchWebhookRow.ID] = batchWebhookRow
+	}
 	return nil
 }
 
@@ -500,7 +528,7 @@ func (s *MemoryStore) ClaimTaskForProcessing(_ context.Context, taskID string, l
 	task.ClaimedUntil = &claimedUntil
 	task.UpdatedAt = s.now
 	s.tasks[taskID] = task
-	s.deriveBatchLocked(task.BatchID)
+	_, _, _ = s.deriveBatchLocked(task.BatchID)
 	return cloneTask(task), true, nil
 }
 
@@ -535,7 +563,7 @@ func (s *MemoryStore) ScheduleTaskRetry(_ context.Context, taskID string, delay 
 	task.Error = retryTaskError(message)
 	task.UpdatedAt = s.now
 	s.tasks[taskID] = task
-	s.deriveBatchLocked(task.BatchID)
+	_, _, _ = s.deriveBatchLocked(task.BatchID)
 	return nil
 }
 
@@ -693,7 +721,7 @@ func (s *MemoryStore) CleanupExpired(_ context.Context, retention time.Duration,
 		}
 		if task.BatchID != "" {
 			s.removeBatchTaskLocked(task.BatchID, task.ID)
-			s.deriveBatchLocked(task.BatchID)
+			_, _, _ = s.deriveBatchLocked(task.BatchID)
 			if len(s.batchTasks[task.BatchID]) == 0 {
 				for webhookID, row := range s.webhookRows {
 					if row.ResourceType == "batch" && row.ResourceID == task.BatchID {
@@ -761,13 +789,13 @@ func (s *MemoryStore) tasksForBatchLocked(batchID string) []Task {
 	return out
 }
 
-func (s *MemoryStore) deriveBatchLocked(batchID string) {
+func (s *MemoryStore) deriveBatchLocked(batchID string) (WebhookOutboxRow, bool, error) {
 	if batchID == "" {
-		return
+		return WebhookOutboxRow{}, false, nil
 	}
 	batch, ok := s.batches[batchID]
 	if !ok {
-		return
+		return WebhookOutboxRow{}, false, nil
 	}
 	wasTerminal := batch.TerminalAt != nil
 	batch.Queued, batch.Processing, batch.Succeeded, batch.Failed = 0, 0, 0, 0
@@ -800,56 +828,74 @@ func (s *MemoryStore) deriveBatchLocked(batchID string) {
 	if batch.Status == BatchStatusCompleted || batch.Status == BatchStatusFailed || batch.Status == BatchStatusPartiallyFailed {
 		batch.TerminalAt = &now
 	}
-	s.batches[batchID] = batch
+	var webhookRow WebhookOutboxRow
+	hasWebhookRow := false
 	if !wasTerminal && batch.TerminalAt != nil {
-		s.createWebhookForTerminalBatchLocked(batch)
+		row, ok, err := s.webhookRowForTerminalBatchLocked(batch)
+		if err != nil {
+			return WebhookOutboxRow{}, false, err
+		}
+		webhookRow = row
+		hasWebhookRow = ok
 	}
+	s.batches[batchID] = batch
+	return webhookRow, hasWebhookRow, nil
 }
 
-func (s *MemoryStore) createWebhookForTerminalTaskLocked(task Task) {
-	if task.BatchID != "" || task.WebhookURL == "" {
-		return
+func (s *MemoryStore) webhookRowForTerminalTaskLocked(task Task) (WebhookOutboxRow, bool, error) {
+	if task.WebhookURL == "" {
+		return WebhookOutboxRow{}, false, nil
 	}
 	endpoint, ok := s.webhooks[webhookKey(task.CallerID, task.WebhookURL)]
 	if !ok {
-		return
+		return WebhookOutboxRow{}, false, nil
+	}
+	eventID := uuid.NewString()
+	body, err := marshalTaskWebhookEvent(eventID, task)
+	if err != nil {
+		return WebhookOutboxRow{}, false, err
 	}
 	row := WebhookOutboxRow{
-		ID:             uuid.NewString(),
+		ID:             eventID,
 		CallerID:       task.CallerID,
 		ResourceType:   "task",
 		ResourceID:     task.ID,
 		DestinationURL: endpoint.URL,
 		SecretID:       endpoint.SecretID,
-		RawBody:        []byte(fmt.Sprintf(`{"type":"task","id":"%s","status":"%s"}`, task.ID, task.Status)),
+		RawBody:        body,
 		NextAttemptAt:  s.now,
 		CreatedAt:      s.now,
 		UpdatedAt:      s.now,
 	}
-	s.webhookRows[row.ID] = row
+	return row, true, nil
 }
 
-func (s *MemoryStore) createWebhookForTerminalBatchLocked(batch Batch) {
+func (s *MemoryStore) webhookRowForTerminalBatchLocked(batch Batch) (WebhookOutboxRow, bool, error) {
 	if batch.WebhookURL == "" {
-		return
+		return WebhookOutboxRow{}, false, nil
 	}
 	endpoint, ok := s.webhooks[webhookKey(batch.CallerID, batch.WebhookURL)]
 	if !ok {
-		return
+		return WebhookOutboxRow{}, false, nil
+	}
+	eventID := uuid.NewString()
+	body, err := marshalBatchWebhookEvent(eventID, batch)
+	if err != nil {
+		return WebhookOutboxRow{}, false, err
 	}
 	row := WebhookOutboxRow{
-		ID:             uuid.NewString(),
+		ID:             eventID,
 		CallerID:       batch.CallerID,
 		ResourceType:   "batch",
 		ResourceID:     batch.ID,
 		DestinationURL: endpoint.URL,
 		SecretID:       endpoint.SecretID,
-		RawBody:        []byte(fmt.Sprintf(`{"type":"batch","id":"%s","status":"%s"}`, batch.ID, batch.Status)),
+		RawBody:        body,
 		NextAttemptAt:  s.now,
 		CreatedAt:      s.now,
 		UpdatedAt:      s.now,
 	}
-	s.webhookRows[row.ID] = row
+	return row, true, nil
 }
 
 func (s *MemoryStore) webhookAllowedLocked(callerID, destinationURL string) bool {
