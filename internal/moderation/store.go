@@ -390,9 +390,14 @@ func (s *MemoryStore) RecordWebhookAttempt(_ context.Context, id, claimToken str
 		StatusCode: statusCode,
 		CreatedAt:  s.now,
 	}
-	if attemptErr != nil {
-		delivery.Error = attemptErr.Error()
-		row.LastError = attemptErr.Error()
+	delivered := attemptErr == nil && statusCode >= 200 && statusCode < 300
+	if !delivered {
+		if attemptErr != nil {
+			delivery.Error = attemptErr.Error()
+			row.LastError = attemptErr.Error()
+		} else {
+			row.LastError = ""
+		}
 		row.ClaimedUntil = nil
 		schedule := WebhookAttemptSchedule()
 		if row.Attempts < len(schedule) {

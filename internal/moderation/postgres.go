@@ -700,7 +700,7 @@ func (s *PostgresStore) insertWebhookTx(ctx context.Context, tx *sql.Tx, callerI
 	var secretID string
 	if err := tx.QueryRowContext(ctx, `select secret_id from moderation_webhook_endpoints where caller_id = $1 and destination_url = $2 and disabled_at is null`, callerID, destinationURL).Scan(&secretID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrWebhookNotAllowed
+			return nil
 		}
 		return err
 	}

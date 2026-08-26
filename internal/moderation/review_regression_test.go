@@ -1,9 +1,12 @@
 package moderation
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -247,6 +250,137 @@ func TestStandaloneTerminalTransitionCreatesWebhookOnce(t *testing.T) {
 	}
 	if rows := store.WebhookOutboxRows(); len(rows) != 1 {
 		t.Fatalf("terminal transition should create one webhook row, got %#v", rows)
+	}
+}
+
+func TestMemoryTerminalTransitionSkipsWebhookWhenEndpointWasRemoved(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore(time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC))
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
+		t.Fatalf("register webhook: %v", err)
+	}
+	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "idem-1",
+		PayloadHash:    "sha256:payload",
+		Input:          textInput("post-1", "hello"),
+		WebhookURL:     "https://hooks.example.com/moderation",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	delete(store.webhooks, webhookKey("client-a", "https://hooks.example.com/moderation"))
+	if err := store.CompleteTask(ctx, task.ID, auditplatform.ModerationResult{
+		ClientItemID: "post-1",
+		Decision:     auditplatform.DecisionPass,
+		RiskLevel:    auditplatform.RiskLevelLow,
+		ProviderName: "fake",
+	}); err != nil {
+		t.Fatalf("complete task should ignore removed webhook endpoint: %v", err)
+	}
+	updated, ok := store.Task(task.ID)
+	if !ok || updated.Status != TaskStatusSucceeded || updated.TerminalAt == nil {
+		t.Fatalf("terminal result must persist without webhook endpoint, ok=%v task=%#v", ok, updated)
+	}
+	if rows := store.WebhookOutboxRows(); len(rows) != 0 {
+		t.Fatalf("removed endpoint should skip webhook outbox, got %#v", rows)
+	}
+}
+
+func TestMemoryWebhookAttemptOnlyMarksDeliveredFor2xxStatus(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	store := NewMemoryStore(now)
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
+		t.Fatalf("register webhook: %v", err)
+	}
+	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "idem-1",
+		PayloadHash:    "sha256:payload",
+		Input:          textInput("post-1", "hello"),
+		WebhookURL:     "https://hooks.example.com/moderation",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := store.FailTask(ctx, task.ID, TaskError{Code: "provider_response", Message: "blocked"}); err != nil {
+		t.Fatalf("fail task: %v", err)
+	}
+	claimed := store.ClaimDueWebhooks(ctx, 1, time.Second)
+	if len(claimed) != 1 {
+		t.Fatalf("expected one webhook row, got %#v", claimed)
+	}
+
+	if !store.RecordWebhookAttempt(ctx, claimed[0].ID, claimed[0].ClaimToken, http.StatusInternalServerError, nil) {
+		t.Fatalf("record non-2xx attempt")
+	}
+	rows := store.WebhookOutboxRows()
+	if len(rows) != 1 || rows[0].DeliveredAt != nil || rows[0].Attempts != 1 || !rows[0].NextAttemptAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("non-2xx nil-error attempt must stay retryable, got %#v", rows)
+	}
+	deliveries := store.WebhookDeliveries()
+	if len(deliveries) != 1 || deliveries[0].StatusCode != http.StatusInternalServerError || deliveries[0].Error != "" {
+		t.Fatalf("delivery should record status without delivered timestamp/error, got %#v", deliveries)
+	}
+}
+
+func TestWebhookDirectRetryReusesStableBodyAndEventID(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	store := NewMemoryStore(now)
+	if err := store.RegisterWebhookEndpoint(ctx, "client-a", "https://hooks.example.com/moderation", "secret-1"); err != nil {
+		t.Fatalf("register webhook: %v", err)
+	}
+	store.SetWebhookSecret("client-a", "secret-1", "top-secret")
+	task, _, err := store.CreateTask(ctx, CreateTaskRequest{
+		CallerID:       "client-a",
+		Operation:      "async_task",
+		IdempotencyKey: "idem-1",
+		PayloadHash:    "sha256:payload",
+		Input:          textInput("post-1", "hello"),
+		WebhookURL:     "https://hooks.example.com/moderation",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if err := store.FailTask(ctx, task.ID, TaskError{Code: "provider_response", Message: "blocked"}); err != nil {
+		t.Fatalf("fail task: %v", err)
+	}
+	httpClient := &fakeWebhookHTTP{status: http.StatusServiceUnavailable}
+	dispatcher := NewWebhookDispatcher(store, httpClient)
+
+	if err := dispatcher.DispatchDueWebhooks(ctx, 1); err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	store.AdvanceClock(time.Minute)
+	if err := dispatcher.DispatchDueWebhooks(ctx, 1); err != nil {
+		t.Fatalf("retry dispatch: %v", err)
+	}
+	if len(httpClient.calls) != 2 {
+		t.Fatalf("expected first attempt plus direct retry, got %#v", httpClient.calls)
+	}
+	if !bytes.Equal(httpClient.calls[0].body, httpClient.calls[1].body) {
+		t.Fatalf("retry must reuse exact webhook body bytes:\nfirst=%s\nsecond=%s", httpClient.calls[0].body, httpClient.calls[1].body)
+	}
+	var first, second struct {
+		EventID string `json:"event_id"`
+	}
+	if err := json.Unmarshal(httpClient.calls[0].body, &first); err != nil {
+		t.Fatalf("decode first body: %v", err)
+	}
+	if err := json.Unmarshal(httpClient.calls[1].body, &second); err != nil {
+		t.Fatalf("decode retry body: %v", err)
+	}
+	if first.EventID == "" || first.EventID != second.EventID {
+		t.Fatalf("retry must preserve event_id, first=%q second=%q", first.EventID, second.EventID)
+	}
+	rows := store.WebhookOutboxRows()
+	if len(rows) != 1 || rows[0].Attempts != 2 || rows[0].DeliveredAt != nil {
+		t.Fatalf("failed direct retry should preserve retry semantics, rows=%#v", rows)
 	}
 }
 

@@ -272,6 +272,38 @@ func TestPostgresCompleteTaskWritesResultWebhookAtomically(t *testing.T) {
 	}
 }
 
+func TestPostgresCompleteTaskCommitsWhenWebhookEndpointWasRemoved(t *testing.T) {
+	db, mock, cleanup := newSQLMock(t)
+	defer cleanup()
+	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	store := NewPostgresStore(db, func() time.Time { return now })
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("select id, caller_id, coalesce\\(batch_id::text, ''\\), client_item_id, content_type, policy, status, coalesce\\(webhook_url, ''\\) from moderation_tasks where id = \\$1 for update").
+		WithArgs("task-1").
+		WillReturnRows(sqlmockRows("id", "caller_id", "batch_id", "client_item_id", "content_type", "policy", "status", "webhook_url").
+			AddRow("task-1", "client-a", "", "post-1", "text", "text.general", "processing", "https://hooks.example.com/moderation"))
+	mock.ExpectExec("update moderation_tasks set status = 'succeeded'").
+		WillReturnResult(sqlmockResult(0, 1))
+	mock.ExpectQuery("select secret_id from moderation_webhook_endpoints").
+		WithArgs("client-a", "https://hooks.example.com/moderation").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectCommit()
+
+	err := store.CompleteTask(context.Background(), "task-1", auditplatform.ModerationResult{
+		ClientItemID: "post-1",
+		Decision:     auditplatform.DecisionPass,
+		RiskLevel:    auditplatform.RiskLevelLow,
+		ProviderName: "fake",
+	})
+	if err != nil {
+		t.Fatalf("complete task should commit result when webhook endpoint was removed: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
 func TestPostgresFailTaskWritesErrorWebhookAtomically(t *testing.T) {
 	db, mock, cleanup := newSQLMock(t)
 	defer cleanup()
@@ -315,6 +347,32 @@ func TestPostgresFailTaskWritesErrorWebhookAtomically(t *testing.T) {
 	}
 	if len(body.body) == 0 {
 		t.Fatalf("expected captured public webhook body")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+func TestPostgresFailTaskCommitsWhenWebhookEndpointWasRemoved(t *testing.T) {
+	db, mock, cleanup := newSQLMock(t)
+	defer cleanup()
+	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	store := NewPostgresStore(db, func() time.Time { return now })
+
+	mock.ExpectBegin()
+	mock.ExpectQuery("select id, caller_id, coalesce\\(batch_id::text, ''\\), client_item_id, content_type, policy, status, correlation_id, coalesce\\(webhook_url, ''\\) from moderation_tasks where id = \\$1 for update").
+		WithArgs("task-2").
+		WillReturnRows(sqlmockRows("id", "caller_id", "batch_id", "client_item_id", "content_type", "policy", "status", "correlation_id", "webhook_url").
+			AddRow("task-2", "client-a", "", "post-2", "text", "text.general", "processing", "corr-2", "https://hooks.example.com/moderation"))
+	mock.ExpectExec("update moderation_tasks set status = 'failed'").
+		WillReturnResult(sqlmockResult(0, 1))
+	mock.ExpectQuery("select secret_id from moderation_webhook_endpoints").
+		WithArgs("client-a", "https://hooks.example.com/moderation").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectCommit()
+
+	if err := store.FailTask(context.Background(), "task-2", TaskError{Code: "provider_response", Message: "blocked"}); err != nil {
+		t.Fatalf("fail task should commit result when webhook endpoint was removed: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("sql expectations: %v", err)
