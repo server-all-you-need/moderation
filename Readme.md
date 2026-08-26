@@ -163,19 +163,89 @@ curl -sS "$BASE_URL/api/v1/moderation-batches/$BATCH_ID/items?limit=50" \
 
 ## Webhook
 
-Webhook 只发送到当前 caller 预登记的 HTTPS endpoint。终态通知不包含原始文本或图片 URL：
+Webhook 只发送到当前 caller 预登记的 HTTPS endpoint。`event_version` 当前固定为 `2`，`event_id` 是稳定事件 ID，接收方应按 `event_id` 去重。终态通知不包含 `caller_id`、`correlation_id`、原始文本、图片 URL、Webhook secret 或 provider risk words。
+
+成功任务事件：
 
 ```json
-{"type":"task","id":"<task-id>","status":"succeeded"}
+{
+  "event_version": 2,
+  "event_id": "<webhook-event-id>",
+  "type": "task",
+  "id": "<task-id>",
+  "batch_id": "<batch-id>",
+  "client_item_id": "avatar-user-42",
+  "content_type": "image",
+  "policy": "image.avatar",
+  "status": "succeeded",
+  "occurred_at": "2026-08-26T12:00:00Z",
+  "result": {
+    "client_item_id": "avatar-user-42",
+    "decision": "pass",
+    "risk_level": "low",
+    "provider_name": "aliyun",
+    "provider_request_id": "<provider-request-id>",
+    "provider_data_id": "<provider-data-id>",
+    "labels": [
+      {
+        "label": "normal",
+        "confidence": 99.8,
+        "description": "normal content"
+      }
+    ]
+  }
+}
 ```
 
-批次通知的 `type` 为 `batch`。请求包含：
+失败任务事件：
+
+```json
+{
+  "event_version": 2,
+  "event_id": "<webhook-event-id>",
+  "type": "task",
+  "id": "<task-id>",
+  "client_item_id": "image-user-7",
+  "content_type": "image",
+  "policy": "image.general",
+  "status": "failed",
+  "occurred_at": "2026-08-26T12:30:00Z",
+  "error": {
+    "code": "provider_response",
+    "message": "blocked"
+  }
+}
+```
+
+批次终态事件：
+
+```json
+{
+  "event_version": 2,
+  "event_id": "<webhook-event-id>",
+  "type": "batch",
+  "id": "<batch-id>",
+  "status": "partially_failed",
+  "occurred_at": "2026-08-26T14:00:00Z",
+  "summary": {
+    "total": 5,
+    "queued": 0,
+    "processing": 0,
+    "succeeded": 3,
+    "failed": 2
+  }
+}
+```
+
+包含 `N` 个条目的批次会产生 `N` 个 task 终态事件，批次整体终态后再产生 1 个 batch summary 事件。Webhook 是 at-least-once 投递；不同事件独立重试，接收顺序可能与任务完成顺序不同，也可能先收到批次 summary 再收到某个 task 事件的重试。接收方应把 `event_id` 去重、把 `id` 当作资源 ID，并在需要时回查公开查询接口。
+
+请求包含：
 
 - `Content-Type: application/json`
 - `X-Moderation-Timestamp: <RFC3339 timestamp>`
 - `X-Moderation-Signature: sha256=<hex hmac>`
 
-签名原文是 `<timestamp>.<raw-body>`，算法为 HMAC-SHA256。接收方应使用登记 secret 验签，并返回任意 `2xx`。失败投递按立即、1 分钟、5 分钟、30 分钟、2 小时、12 小时的计划重试。
+签名原文是 `<timestamp>.<raw-body>`，算法为 HMAC-SHA256。接收方应使用登记 secret 验签，并返回任意 `2xx`。失败投递按立即、1 分钟、5 分钟、30 分钟、2 小时、12 小时的计划重试；第 6 次仍失败后停止领取并不再计入 pending。
 
 ## Admin 内部接口
 

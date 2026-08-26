@@ -385,6 +385,14 @@ func TestBatchCursorPaginationInternalStatsReadinessAndOpenAPI(t *testing.T) {
 	if err := AssertOpenAPIParity(server.Handler(), openapi.Body.Bytes()); err != nil {
 		t.Fatalf("openapi parity: %v", err)
 	}
+	for _, required := range []string{
+		`"WebhookTaskEvent"`, `"WebhookBatchEvent"`, `"event_version"`,
+		`"event_id"`, `"occurred_at"`, `"summary"`,
+	} {
+		if !strings.Contains(openapi.Body.String(), required) {
+			t.Fatalf("OpenAPI missing Webhook contract token %s", required)
+		}
+	}
 }
 
 func TestInternalModerationResponsesIncludeCallerIDButPublicResponsesDoNot(t *testing.T) {

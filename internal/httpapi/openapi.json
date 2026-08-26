@@ -199,6 +199,98 @@
           "risk_words": { "type": "array", "items": { "type": "string" } }
         }
       },
+      "WebhookLabel": {
+        "type": "object",
+        "required": ["label"],
+        "additionalProperties": false,
+        "properties": {
+          "label": { "type": "string" },
+          "confidence": { "type": "number" },
+          "description": { "type": "string" }
+        }
+      },
+      "WebhookModerationResult": {
+        "type": "object",
+        "required": ["client_item_id", "decision", "risk_level", "provider_name"],
+        "additionalProperties": false,
+        "properties": {
+          "client_item_id": { "type": "string" },
+          "decision": { "type": "string", "enum": ["pass", "review", "block"] },
+          "risk_level": { "type": "string", "enum": ["none", "low", "medium", "high"] },
+          "provider_name": { "type": "string" },
+          "provider_request_id": { "type": "string" },
+          "provider_data_id": { "type": "string" },
+          "labels": { "type": "array", "items": { "$ref": "#/components/schemas/WebhookLabel" } }
+        }
+      },
+      "WebhookTaskSucceededEvent": {
+        "type": "object",
+        "required": ["event_version", "event_id", "type", "id", "client_item_id", "content_type", "policy", "status", "occurred_at", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "event_version": { "type": "integer", "enum": [2] },
+          "event_id": { "type": "string" },
+          "type": { "type": "string", "enum": ["task"] },
+          "id": { "type": "string" },
+          "batch_id": { "type": "string" },
+          "client_item_id": { "type": "string" },
+          "content_type": { "type": "string", "enum": ["text", "image"] },
+          "policy": { "type": "string", "enum": ["text.comment", "text.nickname", "text.general", "image.comment", "image.avatar", "image.general"] },
+          "status": { "type": "string", "enum": ["succeeded"] },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "result": { "$ref": "#/components/schemas/WebhookModerationResult" }
+        }
+      },
+      "WebhookTaskFailedEvent": {
+        "type": "object",
+        "required": ["event_version", "event_id", "type", "id", "client_item_id", "content_type", "policy", "status", "occurred_at", "error"],
+        "additionalProperties": false,
+        "properties": {
+          "event_version": { "type": "integer", "enum": [2] },
+          "event_id": { "type": "string" },
+          "type": { "type": "string", "enum": ["task"] },
+          "id": { "type": "string" },
+          "batch_id": { "type": "string" },
+          "client_item_id": { "type": "string" },
+          "content_type": { "type": "string", "enum": ["text", "image"] },
+          "policy": { "type": "string", "enum": ["text.comment", "text.nickname", "text.general", "image.comment", "image.avatar", "image.general"] },
+          "status": { "type": "string", "enum": ["failed"] },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "error": { "$ref": "#/components/schemas/ErrorDetail" }
+        }
+      },
+      "WebhookTaskEvent": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/WebhookTaskSucceededEvent" },
+          { "$ref": "#/components/schemas/WebhookTaskFailedEvent" }
+        ]
+      },
+      "WebhookBatchSummary": {
+        "type": "object",
+        "required": ["total", "queued", "processing", "succeeded", "failed"],
+        "additionalProperties": false,
+        "properties": {
+          "total": { "type": "integer" },
+          "queued": { "type": "integer" },
+          "processing": { "type": "integer" },
+          "succeeded": { "type": "integer" },
+          "failed": { "type": "integer" }
+        }
+      },
+      "WebhookBatchEvent": {
+        "type": "object",
+        "required": ["event_version", "event_id", "type", "id", "status", "occurred_at", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "event_version": { "type": "integer", "enum": [2] },
+          "event_id": { "type": "string" },
+          "type": { "type": "string", "enum": ["batch"] },
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": ["completed", "partially_failed", "failed"] },
+          "occurred_at": { "type": "string", "format": "date-time" },
+          "summary": { "$ref": "#/components/schemas/WebhookBatchSummary" }
+        }
+      },
       "TaskAccepted": {
         "type": "object",
         "required": ["task_id", "status"],
