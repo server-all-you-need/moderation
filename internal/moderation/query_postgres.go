@@ -260,7 +260,7 @@ func (s *PostgresStore) AdminStats(ctx context.Context) (AdminStatsSnapshot, err
 	if stats.ClaimedTaskOutbox, err = s.count(ctx, `select count(*) from moderation_task_outbox where published_at is null and claimed_until >= now()`); err != nil {
 		return stats, err
 	}
-	if stats.PendingWebhookOutbox, err = s.count(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null and next_attempt_at <= now() and (claimed_until is null or claimed_until < now())`); err != nil {
+	if stats.PendingWebhookOutbox, err = s.count(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null and attempts < 6 and next_attempt_at <= now() and (claimed_until is null or claimed_until < now())`); err != nil {
 		return stats, err
 	}
 	if stats.ClaimedWebhookOutbox, err = s.count(ctx, `select count(*) from moderation_webhook_outbox where delivered_at is null and claimed_until >= now()`); err != nil {

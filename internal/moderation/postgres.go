@@ -199,7 +199,7 @@ values ($1,$2,$3,$4,$4,0,0,0,$5,$6,$6)`,
 	}
 	tasks := make([]Task, 0, len(req.Inputs))
 	for i, input := range req.Inputs {
-		task := Task{ID: uuid.NewString(), CallerID: req.CallerID, BatchID: batch.ID, ClientItemID: input.ClientItemID, ContentType: input.ContentType, Policy: input.Policy, Status: TaskStatusQueued, CreatedAt: now, UpdatedAt: now, CorrelationID: uuid.NewString()}
+		task := Task{ID: uuid.NewString(), CallerID: req.CallerID, BatchID: batch.ID, ClientItemID: input.ClientItemID, ContentType: input.ContentType, Policy: input.Policy, Status: TaskStatusQueued, CreatedAt: now, UpdatedAt: now, CorrelationID: uuid.NewString(), WebhookURL: req.WebhookURL}
 		if input.Text != "" {
 			task.Text = &input.Text
 		}
@@ -209,9 +209,9 @@ values ($1,$2,$3,$4,$4,0,0,0,$5,$6,$6)`,
 		outbox := taskOutboxFromTask(task, now)
 		if _, err = tx.ExecContext(ctx, `
 insert into moderation_tasks
-  (id, caller_id, batch_id, client_item_id, content_type, policy, status, text_content, image_url, correlation_id, created_at, updated_at)
-values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11)`,
-			task.ID, task.CallerID, task.BatchID, task.ClientItemID, task.ContentType, task.Policy, task.Status, nullableString(task.Text), nullableString(task.ImageURL), task.CorrelationID, now); err != nil {
+  (id, caller_id, batch_id, client_item_id, content_type, policy, status, text_content, image_url, correlation_id, webhook_url, created_at, updated_at)
+values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)`,
+			task.ID, task.CallerID, task.BatchID, task.ClientItemID, task.ContentType, task.Policy, task.Status, nullableString(task.Text), nullableString(task.ImageURL), task.CorrelationID, nullablePlainString(task.WebhookURL), now); err != nil {
 			return Batch{}, nil, false, err
 		}
 		if _, err = tx.ExecContext(ctx, `insert into moderation_batch_tasks (batch_id, task_id, position) values ($1,$2,$3)`, batch.ID, task.ID, i); err != nil {
@@ -379,7 +379,7 @@ func (s *PostgresStore) CompleteTask(ctx context.Context, taskID string, result 
 	}
 	defer rollbackUnlessDone(tx, &err)
 	var task Task
-	err = tx.QueryRowContext(ctx, `select id, caller_id, coalesce(batch_id::text, ''), status, coalesce(webhook_url, ''), client_item_id from moderation_tasks where id = $1 for update`, taskID).Scan(&task.ID, &task.CallerID, &task.BatchID, &task.Status, &task.WebhookURL, &task.ClientItemID)
+	err = tx.QueryRowContext(ctx, `select id, caller_id, coalesce(batch_id::text, ''), client_item_id, content_type, policy, status, coalesce(webhook_url, '') from moderation_tasks where id = $1 for update`, taskID).Scan(&task.ID, &task.CallerID, &task.BatchID, &task.ClientItemID, &task.ContentType, &task.Policy, &task.Status, &task.WebhookURL)
 	if err != nil {
 		return err
 	}
@@ -390,7 +390,10 @@ func (s *PostgresStore) CompleteTask(ctx context.Context, taskID string, result 
 	if _, err = tx.ExecContext(ctx, `update moderation_tasks set status = 'succeeded', text_content = null, image_url = null, result_json = $1, error_json = null, claimed_until = null, next_attempt_at = null, terminal_at = $2, updated_at = $2 where id = $3`, body, now, task.ID); err != nil {
 		return err
 	}
-	if err = s.createTerminalWebhookTx(ctx, tx, task.CallerID, "task", task.ID, task.WebhookURL, TaskStatusSucceeded); err != nil {
+	task.Status = TaskStatusSucceeded
+	task.Result = &result
+	task.TerminalAt = &now
+	if err = s.createTaskWebhookTx(ctx, tx, task); err != nil {
 		return err
 	}
 	if task.BatchID != "" {
@@ -420,7 +423,7 @@ func (s *PostgresStore) failTaskTxWrapper(ctx context.Context, taskID string, ta
 	}
 	defer rollbackUnlessDone(tx, &err)
 	var task Task
-	err = tx.QueryRowContext(ctx, `select id, caller_id, coalesce(batch_id::text, ''), status, correlation_id, coalesce(webhook_url, '') from moderation_tasks where id = $1 for update`, taskID).Scan(&task.ID, &task.CallerID, &task.BatchID, &task.Status, &task.CorrelationID, &task.WebhookURL)
+	err = tx.QueryRowContext(ctx, `select id, caller_id, coalesce(batch_id::text, ''), client_item_id, content_type, policy, status, correlation_id, coalesce(webhook_url, '') from moderation_tasks where id = $1 for update`, taskID).Scan(&task.ID, &task.CallerID, &task.BatchID, &task.ClientItemID, &task.ContentType, &task.Policy, &task.Status, &task.CorrelationID, &task.WebhookURL)
 	if err != nil {
 		return err
 	}
@@ -440,7 +443,10 @@ func (s *PostgresStore) failTaskTxWrapper(ctx context.Context, taskID string, ta
 			return err
 		}
 	}
-	if err = s.createTerminalWebhookTx(ctx, tx, task.CallerID, "task", task.ID, task.WebhookURL, TaskStatusFailed); err != nil {
+	task.Status = TaskStatusFailed
+	task.Error = &taskErr
+	task.TerminalAt = &now
+	if err = s.createTaskWebhookTx(ctx, tx, task); err != nil {
 		return err
 	}
 	if task.BatchID != "" {
@@ -675,7 +681,19 @@ func (s *PostgresStore) requireWebhookEndpointTx(ctx context.Context, tx *sql.Tx
 	return err
 }
 
-func (s *PostgresStore) createTerminalWebhookTx(ctx context.Context, tx *sql.Tx, callerID, resourceType, resourceID, destinationURL string, status interface{}) error {
+func (s *PostgresStore) createTaskWebhookTx(ctx context.Context, tx *sql.Tx, task Task) error {
+	return s.insertWebhookTx(ctx, tx, task.CallerID, "task", task.ID, task.WebhookURL, func(eventID string) ([]byte, error) {
+		return marshalTaskWebhookEvent(eventID, task)
+	})
+}
+
+func (s *PostgresStore) createBatchWebhookTx(ctx context.Context, tx *sql.Tx, batch Batch) error {
+	return s.insertWebhookTx(ctx, tx, batch.CallerID, "batch", batch.ID, batch.WebhookURL, func(eventID string) ([]byte, error) {
+		return marshalBatchWebhookEvent(eventID, batch)
+	})
+}
+
+func (s *PostgresStore) insertWebhookTx(ctx context.Context, tx *sql.Tx, callerID, resourceType, resourceID, destinationURL string, marshal func(eventID string) ([]byte, error)) error {
 	if destinationURL == "" {
 		return nil
 	}
@@ -686,17 +704,21 @@ func (s *PostgresStore) createTerminalWebhookTx(ctx context.Context, tx *sql.Tx,
 		}
 		return err
 	}
-	body := []byte(fmt.Sprintf(`{"type":"%s","id":"%s","status":"%s"}`, resourceType, resourceID, status))
-	_, err := tx.ExecContext(ctx, `
+	eventID := uuid.NewString()
+	body, err := marshal(eventID)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 insert into moderation_webhook_outbox
   (id, caller_id, resource_type, resource_id, destination_url, secret_id, body_bytes, next_attempt_at, created_at, updated_at)
 values ($1,$2,$3,$4,$5,$6,$7,$8,$8,$8)
-on conflict (resource_type, resource_id) do nothing`, uuid.NewString(), callerID, resourceType, resourceID, destinationURL, secretID, body, s.now())
+on conflict (resource_type, resource_id) do nothing`, eventID, callerID, resourceType, resourceID, destinationURL, secretID, body, s.now())
 	return err
 }
 
 func (s *PostgresStore) deriveBatchTx(ctx context.Context, tx *sql.Tx, batchID string) error {
-	_, err := tx.ExecContext(ctx, `
+	row := tx.QueryRowContext(ctx, `
 with counts as (
   select
     count(*)::int as total_count,
@@ -724,17 +746,23 @@ with counts as (
       updated_at = now()
   from counts c
   where b.id = $1
-  returning b.id, b.caller_id, b.webhook_url, b.status, b.terminal_at
+  returning b.id, b.caller_id, b.status, b.total_count, b.queued_count,
+            b.processing_count, b.succeeded_count, b.failed_count,
+            coalesce(b.webhook_url, ''), b.created_at, b.updated_at, b.terminal_at
 )
-insert into moderation_webhook_outbox (id, caller_id, resource_type, resource_id, destination_url, secret_id, body_bytes, next_attempt_at, created_at, updated_at)
-select gen_random_uuid(), u.caller_id, 'batch', u.id, u.webhook_url, e.secret_id,
-       convert_to(format('{"type":"batch","id":"%s","status":"%s"}', u.id, u.status), 'utf8'),
-       now(), now(), now()
-from updated u
-join moderation_webhook_endpoints e on e.caller_id = u.caller_id and e.destination_url = u.webhook_url and e.disabled_at is null
-where u.terminal_at is not null and u.webhook_url is not null
-on conflict (resource_type, resource_id) do nothing`, batchID)
-	return err
+select id, caller_id, status, total_count, queued_count, processing_count,
+       succeeded_count, failed_count, webhook_url, created_at, updated_at, terminal_at
+from updated`, batchID)
+	var batch Batch
+	var terminal sql.NullTime
+	if err := row.Scan(&batch.ID, &batch.CallerID, &batch.Status, &batch.Total, &batch.Queued, &batch.Processing, &batch.Succeeded, &batch.Failed, &batch.WebhookURL, &batch.CreatedAt, &batch.UpdatedAt, &terminal); err != nil {
+		return err
+	}
+	if terminal.Valid {
+		batch.TerminalAt = &terminal.Time
+		return s.createBatchWebhookTx(ctx, tx, batch)
+	}
+	return nil
 }
 
 func (s *PostgresStore) loadTaskTx(ctx context.Context, tx *sql.Tx, taskID string) (Task, error) {

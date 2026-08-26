@@ -548,7 +548,10 @@ func TestPostgresClaimAndRetryRefreshBatchCountsInTransaction(t *testing.T) {
 		WillReturnRows(sqlmockRows("id", "caller_id", "batch_id", "client_item_id", "content_type", "policy", "text_content", "image_url", "attempts", "correlation_id", "webhook_url").
 			AddRow("task-1", "client-a", "batch-1", "post-1", "text", "text.general", "hello", "", 0, "corr-1", ""))
 	mock.ExpectExec("update moderation_tasks set status = 'processing'").WillReturnResult(sqlmockResult(1, 1))
-	mock.ExpectExec("with counts as").WillReturnResult(sqlmockResult(0, 1))
+	mock.ExpectQuery("with counts as").
+		WithArgs("batch-1").
+		WillReturnRows(sqlmockRows("id", "caller_id", "status", "total_count", "queued_count", "processing_count", "succeeded_count", "failed_count", "webhook_url", "created_at", "updated_at", "terminal_at").
+			AddRow("batch-1", "client-a", "processing", 1, 0, 1, 0, 0, "", time.Now(), time.Now(), nil))
 	mock.ExpectCommit()
 	if _, claimed, err := store.ClaimTaskForProcessing(context.Background(), "task-1", 30*time.Second); err != nil || !claimed {
 		t.Fatalf("claim task: claimed=%v err=%v", claimed, err)
@@ -558,7 +561,10 @@ func TestPostgresClaimAndRetryRefreshBatchCountsInTransaction(t *testing.T) {
 	mock.ExpectQuery("select coalesce\\(batch_id::text, ''\\) from moderation_tasks").
 		WillReturnRows(sqlmockRows("batch_id").AddRow("batch-1"))
 	mock.ExpectExec("update moderation_tasks set status = 'queued'").WillReturnResult(sqlmockResult(0, 1))
-	mock.ExpectExec("with counts as").WillReturnResult(sqlmockResult(0, 1))
+	mock.ExpectQuery("with counts as").
+		WithArgs("batch-1").
+		WillReturnRows(sqlmockRows("id", "caller_id", "status", "total_count", "queued_count", "processing_count", "succeeded_count", "failed_count", "webhook_url", "created_at", "updated_at", "terminal_at").
+			AddRow("batch-1", "client-a", "queued", 1, 1, 0, 0, 0, "", time.Now(), time.Now(), nil))
 	mock.ExpectCommit()
 	if err := store.ScheduleTaskRetry(context.Background(), "task-1", 5*time.Second, "temporary"); err != nil {
 		t.Fatalf("schedule retry: %v", err)
