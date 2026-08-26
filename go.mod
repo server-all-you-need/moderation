@@ -1,4 +1,4 @@
-module github.com/Xushengqwer/post_audit
+module github.com/server-all-you-need/moderation
 
 go 1.23.7
 

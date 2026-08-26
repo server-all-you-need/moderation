@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 func textInput(id, text string) auditplatform.ModerationInput {

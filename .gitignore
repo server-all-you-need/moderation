@@ -21,6 +21,6 @@ build/
 config.local.yaml
 config.secrets.yaml
 
-post_audit_service
+moderation
 kafkatestproducer
 *.exe

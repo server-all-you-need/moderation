@@ -12,7 +12,7 @@ import (
 	"github.com/alibabacloud-go/tea/dara"
 	"github.com/alibabacloud-go/tea/tea"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 func TestModerateTextUsesTextModerationPlusRequestAndNormalizesResponse(t *testing.T) {

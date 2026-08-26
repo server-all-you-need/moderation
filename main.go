@@ -19,12 +19,12 @@ import (
 
 	"github.com/IBM/sarama"
 	"github.com/Xushengqwer/go-common/core"
-	"github.com/Xushengqwer/post_audit/internal/aliyunclient"
-	"github.com/Xushengqwer/post_audit/internal/config"
-	"github.com/Xushengqwer/post_audit/internal/httpapi"
-	"github.com/Xushengqwer/post_audit/internal/moderation"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+	"github.com/server-all-you-need/moderation/internal/aliyunclient"
+	"github.com/server-all-you-need/moderation/internal/config"
+	"github.com/server-all-you-need/moderation/internal/httpapi"
+	"github.com/server-all-you-need/moderation/internal/moderation"
 	"github.com/xdg-go/scram"
 	"go.uber.org/zap"
 )
@@ -263,7 +263,7 @@ func newSaramaConfig(cfg config.KafkaConfig) (*sarama.Config, error) {
 	}
 	saramaCfg := sarama.NewConfig()
 	saramaCfg.Version = version
-	saramaCfg.ClientID = "post-audit-pro-moderation"
+	saramaCfg.ClientID = "moderation"
 	if err := applyKafkaSecurity(saramaCfg, cfg); err != nil {
 		return nil, err
 	}

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 	"github.com/lib/pq"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 func (s *PostgresStore) UpsertAPIClient(ctx context.Context, client APIClient) error {

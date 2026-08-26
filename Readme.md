@@ -1,6 +1,6 @@
 # PostAudit Pro
 
-`post-audit-pro` is the moderation platform V2 service. It exposes authenticated HTTP APIs for synchronous checks, durable asynchronous tasks, mixed batches, and cluster-internal Admin visibility.
+`moderation` is the moderation platform V2 service. It exposes authenticated HTTP APIs for synchronous checks, durable asynchronous tasks, mixed batches, and cluster-internal Admin visibility.
 
 ## Runtime
 

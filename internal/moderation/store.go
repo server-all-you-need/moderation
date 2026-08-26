@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 	"github.com/google/uuid"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 type idempotencyRecord struct {

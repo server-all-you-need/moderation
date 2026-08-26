@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
   --mount=type=cache,target=/root/.cache/go-build \
-  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/post_audit_service ./main.go
+  CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/moderation ./main.go
 
 
 # =================================================================
@@ -27,7 +27,7 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /app/post_audit_service /app/post_audit_service
+COPY --from=builder /app/moderation /app/moderation
 
 # 【关键修正】确保目标目录存在，并将开发配置文件复制并重命名
 RUN mkdir -p /app/config
@@ -36,5 +36,5 @@ COPY internal/config/config.development.yaml /app/config/config.yaml
 # 【关键修正】由于没有HTTP服务，移除所有 EXPOSE 和 HEALTHCHECK 指令
 
 # 定义容器的启动命令
-ENTRYPOINT ["/app/post_audit_service"]
+ENTRYPOINT ["/app/moderation"]
 CMD ["--config=/app/config/config.yaml"]

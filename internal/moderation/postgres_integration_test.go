@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
 	_ "github.com/lib/pq"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 func TestPostgresLiveClaimTaskOutbox(t *testing.T) {

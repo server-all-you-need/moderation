@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 func newSQLMock(t *testing.T) (*sql.DB, sqlmock.Sqlmock, func()) {

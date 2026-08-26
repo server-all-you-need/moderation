@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
-	"github.com/Xushengqwer/post_audit/internal/moderation"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
+	"github.com/server-all-you-need/moderation/internal/moderation"
 )
 
 type stubProvider struct {

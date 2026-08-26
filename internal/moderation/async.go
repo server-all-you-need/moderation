@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Xushengqwer/post_audit/internal/auditplatform"
+	"github.com/server-all-you-need/moderation/internal/auditplatform"
 )
 
 const (

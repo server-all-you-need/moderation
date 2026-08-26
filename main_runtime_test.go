@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/Xushengqwer/post_audit/internal/config"
+	"github.com/server-all-you-need/moderation/internal/config"
 )
 
 func TestSaramaConfigAppliesRuntimeSecurityProducerAndConsumerSettings(t *testing.T) {
