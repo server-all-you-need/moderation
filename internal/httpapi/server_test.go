@@ -214,6 +214,26 @@ func TestPublicRequestDTOsRejectWebhookOutsideTopLevelAsyncAndBatch(t *testing.T
 	}
 }
 
+func TestAsyncSubmissionsReturnAcceptedWithoutProviderOrSyncBudget(t *testing.T) {
+	server, _, provider, limiter := newTestServer(t)
+
+	task := doJSON(server, http.MethodPost, "/api/v1/moderation-tasks", "test-token", map[string]string{"Idempotency-Key": "async-task-nonblocking"}, `{"client_item_id":"post-async","content_type":"text","policy":"text.general","text":"hello"}`)
+	if task.Code != http.StatusAccepted {
+		t.Fatalf("async task status = %d, want 202 body=%s", task.Code, task.Body.String())
+	}
+	if provider.calls != 0 || limiter.callerCalls != 1 || limiter.syncCalls != 0 {
+		t.Fatalf("async task must only consume caller budget and defer provider work, provider=%d caller=%d sync=%d", provider.calls, limiter.callerCalls, limiter.syncCalls)
+	}
+
+	batch := doJSON(server, http.MethodPost, "/api/v1/moderation-batches", "test-token", map[string]string{"Idempotency-Key": "async-batch-nonblocking"}, `{"items":[{"client_item_id":"post-batch-1","content_type":"text","policy":"text.general","text":"one"},{"client_item_id":"post-batch-2","content_type":"text","policy":"text.general","text":"two"}]}`)
+	if batch.Code != http.StatusAccepted {
+		t.Fatalf("async batch status = %d, want 202 body=%s", batch.Code, batch.Body.String())
+	}
+	if provider.calls != 0 || limiter.callerCalls != 2 || limiter.syncCalls != 0 {
+		t.Fatalf("async batch must only consume caller budget and defer provider work, provider=%d caller=%d sync=%d", provider.calls, limiter.callerCalls, limiter.syncCalls)
+	}
+}
+
 func TestProviderFailureAndBodyLimitMatchOpenAPI(t *testing.T) {
 	server, _, provider, _ := newTestServer(t)
 	provider.err = &auditplatform.ProviderError{Code: auditplatform.ErrorCodeProviderTemporary, Message: "upstream request detail"}
