@@ -5,8 +5,10 @@
 # =================================================================
 FROM golang:1.26-alpine AS builder
 
+ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct
+
 WORKDIR /app
-RUN apk add --no-cache git
+RUN sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#' /etc/apk/repositories && apk add --no-cache git
 
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
@@ -23,7 +25,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.21
 
 # 安装 ca-certificates 对需要访问外部HTTPS服务的应用（如阿里云）至关重要
-RUN apk --no-cache add ca-certificates
+RUN sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#' /etc/apk/repositories && apk --no-cache add ca-certificates
 
 WORKDIR /app
 
