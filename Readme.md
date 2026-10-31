@@ -323,6 +323,6 @@ make deploy-moderation ENV=dev SERVER=<ssh-target>
 make deploy-moderation ENV=prod SERVER=<ssh-target>
 ```
 
-完整环境还可以使用 `make deploy-lively-dev` 或 `make deploy-satori-prod`。部署前后应分别通过 runtime preflight、rollout status、`/healthz`、`/readyz` 和带真实 caller transport 的受保护 API smoke 验证。
+完整环境还可以使用 `make deploy-satori-prod`。部署前后应分别通过 runtime preflight、rollout status、`/healthz`、`/readyz` 和带真实 caller transport 的受保护 API smoke 验证。
 
 历史审核 Kafka topic 与 `audit_tasks` 表为回滚和审计连续性保留，但 moderation V2 不再读写 legacy payload-bearing topic，也不要求在切换时直接删除旧资产。
