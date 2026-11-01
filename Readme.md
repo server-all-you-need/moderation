@@ -272,7 +272,7 @@ Admin 使用独立 Bearer token，只能通过集群内 `http://moderation:8080`
 ## 健康检查与错误定位
 
 - `GET /healthz`：只表示 HTTP 进程存活，不需要鉴权。
-- `GET /readyz`：检查 PostgreSQL、Redis 和 Kafka；依赖异常时返回 `503`，响应不会泄露内部配置。
+- `GET /readyz`：检查 PostgreSQL、Redis 和 Kafka；依赖异常时返回 `503`，响应不会泄露内部配置。PostgreSQL 与 Redis 使用 1 秒超时的 ping，Kafka 判定来自后台探测缓存（每 15 秒刷新一次），因此探针不受 Kafka 网络阻塞影响；进程在 Kafka 不可用时仍会启动，并在依赖恢复后自动重新就绪。
 - `GET /openapi.json`：返回公共 API 契约，不需要鉴权。
 
 常见响应：

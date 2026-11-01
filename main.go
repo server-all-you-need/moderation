@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -13,7 +14,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -109,29 +109,6 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 	if err != nil {
 		return err
 	}
-	clusterAdmin, err := sarama.NewClusterAdmin(cfg.Kafka.Brokers, saramaCfg)
-	if err != nil {
-		return err
-	}
-	defer clusterAdmin.Close()
-	kafkaClient, err := sarama.NewClient(cfg.Kafka.Brokers, saramaCfg)
-	if err != nil {
-		return err
-	}
-	defer kafkaClient.Close()
-	if err := moderation.EnsureModerationTopics(moderation.NewSaramaTopicAdmin(clusterAdmin)); err != nil {
-		return err
-	}
-	producer, err := sarama.NewSyncProducer(cfg.Kafka.Brokers, saramaCfg)
-	if err != nil {
-		return err
-	}
-	publisher := moderation.NewSaramaPublisher(producer)
-	defer publisher.Close()
-	consumerGroup, err := sarama.NewConsumerGroup(cfg.Kafka.Brokers, cfg.Kafka.ConsumerGroupID, saramaCfg)
-	if err != nil {
-		return err
-	}
 
 	worker := moderation.NewWorkerWithOptions(moderation.WorkerOptions{
 		Store:          store,
@@ -141,53 +118,39 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 	})
 	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
 	defer cancelRuntime()
-	var consumerFailed atomic.Bool
-	var consumerErr atomic.Value
 
 	webhookDispatcher := moderation.NewWebhookDispatcherWithSecretResolver(store, newRuntimeSecrets(cfg.APIClients, cfg.WebhookSecrets), moderation.NetWebhookClient{Client: &http.Client{Timeout: timeoutMs(cfg.Server.WriteTimeoutMs, 10*time.Second)}})
+
+	var kafkaRT *kafkaRuntime
+	kafkaRT = newKafkaRuntime(kafkaRuntimeOptions{
+		bootstrap: newKafkaBootstrap(cfg.Kafka, saramaCfg),
+		consume: func(consumeCtx context.Context, resources *kafkaResources) error {
+			return moderation.RunTaskConsumerGroup(consumeCtx, resources.consumerGroup, worker, kafkaRT.Publisher())
+		},
+		probe:         newKafkaProbe(3 * time.Second),
+		logger:        logger.Logger(),
+		probeInterval: 15 * time.Second,
+	})
+	defer kafkaRT.Close()
+	publisher := kafkaRT.Publisher()
+
 	server, err := httpapi.NewServer(httpapi.Config{
 		Store:            store,
 		Provider:         aliClient,
 		Limiter:          limiter,
-		LagReporter:      moderation.NewSaramaLagReporter(clusterAdmin, kafkaClient, cfg.Kafka.ConsumerGroupID, moderation.TopicModerationTasksV1),
+		LagReporter:      newKafkaRuntimeLagReporter(kafkaRT, cfg.Kafka.ConsumerGroupID, moderation.TopicModerationTasksV1),
 		Clients:          httpClients(cfg.APIClients),
 		AdminTokenSHA256: cfg.Admin.TokenSHA256,
-		Ready: func(readyCtx context.Context) error {
-			if err := db.PingContext(readyCtx); err != nil {
-				return err
-			}
-			if err := redisClient.Ping(readyCtx).Err(); err != nil {
-				return err
-			}
-			if consumerFailed.Load() {
-				if value := consumerErr.Load(); value != nil {
-					return fmt.Errorf("task consumer stopped: %v", value)
-				}
-				return fmt.Errorf("task consumer stopped")
-			}
-			_, err := clusterAdmin.DescribeTopics([]string{moderation.TopicModerationTasksV1, moderation.TopicModerationTaskDLQ})
-			return err
-		},
+		Ready:            newReadyProbe(db.PingContext, redisPing(redisClient), kafkaRT.Ready, time.Second, logger.Logger()),
 	})
 	if err != nil {
 		return err
 	}
 
+	kafkaRT.Start(runtimeCtx)
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, 2)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := moderation.RunTaskConsumerGroup(runtimeCtx, consumerGroup, worker, publisher); err != nil && runtimeCtx.Err() == nil {
-			consumerFailed.Store(true)
-			consumerErr.Store(err.Error())
-			logger.Error("moderation task consumer stopped", zap.Error(err))
-			select {
-			case errCh <- err:
-			default:
-			}
-		}
-	}()
 	startLoop := func(interval time.Duration, fn func(context.Context)) {
 		wg.Add(1)
 		go func() {
@@ -196,7 +159,7 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		}()
 	}
 	startLoop(500*time.Millisecond, func(loopCtx context.Context) {
-		if err := moderation.PublishTaskOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
+		if err := moderation.PublishTaskOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil && !isKafkaNotReady(err) {
 			logger.Error("publish task outbox failed", zap.Error(err))
 		}
 	})
@@ -206,7 +169,7 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		}
 	})
 	startLoop(time.Second, func(loopCtx context.Context) {
-		if err := moderation.PublishDLQOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil {
+		if err := moderation.PublishDLQOutbox(loopCtx, store, publisher, 100, 30*time.Second); err != nil && !isKafkaNotReady(err) {
 			logger.Error("publish dlq outbox failed", zap.Error(err))
 		}
 	})
@@ -419,6 +382,43 @@ func (c *xdgSCRAMClient) Step(challenge string) (string, error) {
 
 func (c *xdgSCRAMClient) Done() bool {
 	return c.conversation.Done()
+}
+
+func redisPing(client *redis.Client) func(context.Context) error {
+	return func(ctx context.Context) error { return client.Ping(ctx).Err() }
+}
+
+// isKafkaNotReady reports whether err only means "Kafka is still bootstrapping".
+// The runtime already logs that state, so callers skip their own error log.
+func isKafkaNotReady(err error) bool {
+	return errors.Is(err, errKafkaNotReady)
+}
+
+// newReadyProbe builds the /readyz check. PostgreSQL and Redis pings are capped
+// by timeout so a hung dependency cannot hold the probe past its deadline;
+// Kafka is read from the runtime's background probe cache instead of a live
+// metadata call.
+func newReadyProbe(dbPing, redisPing func(context.Context) error, kafkaReady func() error, timeout time.Duration, logger *zap.Logger) func(context.Context) error {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	return func(ctx context.Context) error {
+		pingCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		if err := dbPing(pingCtx); err != nil {
+			logger.Error("readyz dependency check failed", zap.String("dependency", "postgres"), zap.Error(err))
+			return fmt.Errorf("postgres: %w", err)
+		}
+		if err := redisPing(pingCtx); err != nil {
+			logger.Error("readyz dependency check failed", zap.String("dependency", "redis"), zap.Error(err))
+			return fmt.Errorf("redis: %w", err)
+		}
+		if err := kafkaReady(); err != nil {
+			logger.Error("readyz dependency check failed", zap.String("dependency", "kafka"), zap.Error(err))
+			return fmt.Errorf("kafka: %w", err)
+		}
+		return nil
+	}
 }
 
 func runEvery(ctx context.Context, interval time.Duration, fn func(context.Context)) {
