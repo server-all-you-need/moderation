@@ -73,6 +73,12 @@ func run(ctx context.Context, cfg config.AppConfig, logger *core.ZapLogger) erro
 		return err
 	}
 	defer db.Close()
+	// The moderation database runs through pgbouncer in session pooling because
+	// lib/pq cannot share server connections across its Parse/Bind round trips.
+	// Session pooling ties up one backend connection per client connection, so
+	// keep the client pool small instead of leaving it unbounded.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	if err := db.PingContext(ctx); err != nil {
 		return err
 	}
