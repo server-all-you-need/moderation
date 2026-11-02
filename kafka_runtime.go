@@ -122,26 +122,35 @@ func (r *kafkaRuntime) run(ctx context.Context) {
 		r.setReady(nil)
 		backoff = r.opts.initialBackoff
 
-		probeCtx, stopProbe := context.WithCancel(ctx)
-		go r.probeLoop(probeCtx, resources)
+		cycleCtx, stopCycle := context.WithCancel(ctx)
+		probeCtx, stopProbe := context.WithCancel(cycleCtx)
+		go r.probeLoop(probeCtx, resources, stopCycle)
 
-		err = r.opts.consume(ctx, resources)
+		err = r.opts.consume(cycleCtx, resources)
+		recycled := cycleCtx.Err() != nil
 		stopProbe()
+		stopCycle()
 		closeKafkaResources(resources)
 		r.setResources(nil)
 		if ctx.Err() != nil {
 			return
 		}
 
-		reason := errKafkaNotReady
-		if err != nil {
-			reason = fmt.Errorf("task consumer stopped: %w", err)
+		if recycled {
+			r.opts.logger.Error("kafka resources recycled after repeated probe failures",
+				zap.Duration("retry_in", backoff),
+			)
+		} else {
+			reason := errKafkaNotReady
+			if err != nil {
+				reason = fmt.Errorf("task consumer stopped: %w", err)
+			}
+			r.setReady(reason)
+			r.opts.logger.Error("moderation task consumer stopped",
+				zap.Error(err),
+				zap.Duration("retry_in", backoff),
+			)
 		}
-		r.setReady(reason)
-		r.opts.logger.Error("moderation task consumer stopped",
-			zap.Error(err),
-			zap.Duration("retry_in", backoff),
-		)
 		if !sleepContext(ctx, backoff) {
 			return
 		}
@@ -149,9 +158,17 @@ func (r *kafkaRuntime) run(ctx context.Context) {
 	}
 }
 
-func (r *kafkaRuntime) probeLoop(ctx context.Context, resources *kafkaResources) {
+// probeFailureLimit is the number of consecutive failed probes after which the
+// runtime rebuilds its Kafka resources. sarama keeps a broker's dead connection
+// cached: Broker.Open is a no-op while the broker is still marked open, so a
+// single broken pipe keeps every later request on that connection failing.
+// Rebuilding the resources is the only way back to a healthy connection.
+const probeFailureLimit = 2
+
+func (r *kafkaRuntime) probeLoop(ctx context.Context, resources *kafkaResources, recycle context.CancelFunc) {
 	ticker := time.NewTicker(r.opts.probeInterval)
 	defer ticker.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -162,10 +179,19 @@ func (r *kafkaRuntime) probeLoop(ctx context.Context, resources *kafkaResources)
 				if ctx.Err() != nil {
 					return
 				}
+				failures++
 				r.setReady(err)
-				r.opts.logger.Error("kafka health probe failed", zap.Error(err))
+				r.opts.logger.Error("kafka health probe failed",
+					zap.Error(err),
+					zap.Int("consecutive_failures", failures),
+				)
+				if failures >= probeFailureLimit {
+					recycle()
+					return
+				}
 				continue
 			}
+			failures = 0
 			r.setReady(nil)
 		}
 	}

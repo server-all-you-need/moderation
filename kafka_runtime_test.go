@@ -110,6 +110,41 @@ func TestKafkaRuntimeProbeFailureClearsReadiness(t *testing.T) {
 	waitUntil(t, time.Second, func() bool { return runtime.Ready() != nil })
 }
 
+func TestKafkaRuntimeRecyclesResourcesWhenProbeKeepsFailing(t *testing.T) {
+	var bootstraps atomic.Int32
+	consuming := make(chan struct{}, 4)
+	opts := testRuntimeOptions()
+	opts.bootstrap = func(context.Context) (*kafkaResources, error) {
+		bootstraps.Add(1)
+		return &kafkaResources{}, nil
+	}
+	opts.consume = func(ctx context.Context, _ *kafkaResources) error {
+		select {
+		case consuming <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	opts.probe = func(context.Context, *kafkaResources) error {
+		return errors.New("write tcp: broken pipe")
+	}
+	runtime := newKafkaRuntime(opts)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runtime.Start(ctx)
+	select {
+	case <-consuming:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime did not start consuming")
+	}
+
+	// A dead cached broker connection in sarama never reconnects on its own, so
+	// repeated probe failures must rebuild the Kafka resources.
+	waitUntil(t, 2*time.Second, func() bool { return bootstraps.Load() >= 2 })
+}
+
 func TestKafkaRuntimeStopsAfterContextCancel(t *testing.T) {
 	var attempts atomic.Int32
 	opts := testRuntimeOptions()
